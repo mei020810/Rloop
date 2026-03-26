@@ -1,0 +1,1084 @@
+# 统计所有样本的peak数量
+echo "=== 各样本Peak数量统计 ==="
+printf "%-30s %-10s %-10s\n" "Sample" "Peaks" "Type"
+echo "------------------------------------------------"
+
+for summit_file in /data/mshe/rloopData/macs3_results_*/*_peaks.narrowPeak; do
+    sample=$(basename "$summit_file" _nomodel.macs3_peaks.narrowPeak)
+    peak_count=$(awk '!/^#/ && !/^$/ {count++} END {print count}' "$summit_file")
+    
+    # 判断样本类型
+    if [[ "$sample" == *"input"* ]]; then
+        type="Input"
+    elif [[ "$sample" == *"IP"* ]]; then
+        type="IP"
+    else
+        type="Unknown"
+    fi
+    
+    printf "%-30s %-10s %-10s\n" "$sample" "$peak_count" "$type"
+done | sort -k2 -nr  # 按peak数量降序排列
+
+# 观察到ZH13-1和HX3-1的peak值高达10w+，观察一下不同q值下的数值
+for threshold in 0.01 0.001 0.0001; do
+    logval=$(echo "-l($threshold)/l(10)" | bc -l)
+    count=$(awk -v logq=$logval '$9 > logq' "/data/mshe/rloopData/macs3_results_full/HX3-1-IP_x800_bw2_nomodel.macs3_peaks.narrowPeak" | wc -l)
+    echo "q < $threshold: $count peaks"
+done
+for file in /data/mshe/rloopData/macs3_results_*/*peaks.narrowPeak; do
+    sample=$(basename "$file" _nomodel.macs3_peaks.narrowPeak)
+    
+    echo -n "$sample: "
+    echo -n "q<0.05=$(awk '$9 > 1.301' "$file" | wc -l), "
+    echo -n "q<0.01=$(awk '$9 > 2' "$file" | wc -l), "
+    echo "q<0.001=$(awk '$9 > 3' "$file" | wc -l)"
+done
+
+# 用bedtools看一下overlap
+vim test_peak_overlap.sh
+#!/bin/bash
+echo "=== 推荐的Overlap分析 ==="
+printf "%-25s %-8s %-8s %-8s %-8s %-8s\n" "Condition" "Rep1" "Rep2" "Strict" "50bp" "100bp"
+echo "------------------------------------------------------------------------"
+
+for variety in HC22 HH43 HX3 Wm82 ZH13; do
+    # Input重复
+    rep1="/data/mshe/rloopData/macs3_results_full/${variety}-1-input_x800_bw2_nomodel.macs3_summits.bed"
+    rep2="/data/mshe/rloopData/macs3_results_full/${variety}-2-input_x800_bw2_nomodel.macs3_summits.bed"
+    
+    if [ -f "$rep1" ] && [ -f "$rep2" ]; then
+        rep1_count=$(wc -l < "$rep1")
+        rep2_count=$(wc -l < "$rep2")
+        
+        # 三种overlap计算方法
+        strict=$(bedtools intersect -a "$rep1" -b "$rep2" -wa -u | wc -l)
+        window50=$(bedtools window -a "$rep1" -b "$rep2" -w 50 | wc -l)
+        window100=$(bedtools window -a "$rep1" -b "$rep2" -w 100 | wc -l)
+        
+        printf "%-25s %-8s %-8s %-8s %-8s %-8s\n" \
+            "${variety}-input" "$rep1_count" "$rep2_count" "$strict" "$window50" "$window100"
+    fi
+
+    # IP重复
+    rep1="/data/mshe/rloopData/macs3_results_full/${variety}-1-IP_x800_bw2_nomodel.macs3_summits.bed"
+    rep2="/data/mshe/rloopData/macs3_results_full/${variety}-2-IP_x800_bw2_nomodel.macs3_summits.bed"
+    
+    if [ -f "$rep1" ] && [ -f "$rep2" ]; then
+        rep1_count=$(wc -l < "$rep1")
+        rep2_count=$(wc -l < "$rep2")
+        
+        strict=$(bedtools intersect -a "$rep1" -b "$rep2" -wa -u | wc -l)
+        window50=$(bedtools window -a "$rep1" -b "$rep2" -w 50 | wc -l)
+        window100=$(bedtools window -a "$rep1" -b "$rep2" -w 100 | wc -l)
+        
+        printf "%-25s %-8s %-8s %-8s %-8s %-8s\n" \
+            "${variety}-IP" "$rep1_count" "$rep2_count" "$strict" "$window50" "$window100"
+    fi
+done
+chmod u+x test_peak_overlap.sh
+./test_peak_overlap.sh
+
+#运行q值为0.01的peakcalling
+vim q0_01_macs3_peak_calling.sh
+#!/bin/bash
+mkdir -p /data/mshe/rloopData/q0_01_macs3_results_full
+mkdir -p /data/mshe/rloopData/q0_01_macs3_results_wRloop
+mkdir -p /data/mshe/rloopData/q0_01_macs3_results_cRloop
+
+echo "=== 开始MACS3 Peak Calling ==="
+echo "开始时间: $(date)"
+
+# 1. 全数据peak calling
+echo "1. 全数据peak calling..."
+for bam_file in /data/mshe/rloopData/picard/*_x800_picard.bam; do
+    sample=$(basename "$bam_file" _x800_picard.bam)
+    output_prefix="/data/mshe/rloopData/q0_01_macs3_results_full/${sample}_x800_bw2_q0_01_nomodel.macs3"
+    # 检查是否已经运行过
+    if [ -f "${output_prefix}_peaks.xls" ]; then
+        echo "跳过已处理的样本：$sample"
+        continue
+    fi
+    echo "处理样本：$sample"
+    macs3 callpeak -t "$bam_file" \
+    --extsize 200 -q 0.01 \
+    --nomodel --SPMR -f BAM \
+    -g 1e+9 -B \
+    -n "$output_prefix"
+done
+
+echo "2. wRloop peak calling..."
+for wRloop_file in /data/mshe/rloopData/bam_wRloop/*_x800_wRloop.sorted.bam; do
+    sample=$(basename "$wRloop_file" _x800_wRloop.sorted.bam)
+    output_prefix="/data/mshe/rloopData/q0_01_macs3_results_wRloop/${sample}_x800_bw2_wRloop_q0_01_nomodel.macs3"
+    # 检查是否已经运行过
+    if [ -f "${output_prefix}_peaks.xls" ]; then
+        echo "跳过已处理的样本：$sample"
+        continue
+    fi
+    echo "处理样本：$sample"
+    macs3 callpeak -t "$wRloop_file" \
+    --extsize 200 -q 0.01 \
+    --nomodel --SPMR -f BAM \
+    -g 1e+9 -B \
+    -n "$output_prefix"
+done
+
+echo "3. cRloop peak calling..."
+for cRloop_file in /data/mshe/rloopData/bam_cRloop/*_x800_cRloop.sorted.bam; do
+    sample=$(basename "$cRloop_file" _x800_cRloop.sorted.bam)
+    output_prefix="/data/mshe/rloopData/q0_01_macs3_results_cRloop/${sample}_x800_bw2_cRloop_q0_01_nomodel.macs3"
+    # 检查是否已经运行过
+    if [ -f "${output_prefix}_peaks.xls" ]; then
+        echo "跳过已处理的样本：$sample"
+        continue
+    fi
+    echo "处理样本：$sample"
+    macs3 callpeak -t "$cRloop_file" \
+    --extsize 200 -q 0.01 \
+    --nomodel --SPMR -f BAM \
+    -g 1e+9 -B \
+    -n "$output_prefix"
+done
+echo "=== MACS3 Peak Calling 完成 ==="
+echo "结束时间: $(date)"
+
+chmod u+x q0_01_macs3_peak_calling.sh
+nohup ./q0_01_macs3_peak_calling.sh > q0_01_macs3_peak_calling.log 2>&1 &
+
+echo "=== 各样本Peak数量统计 ==="
+printf "%-30s %-10s %-10s\n" "Sample" "Peaks" "Type"
+echo "------------------------------------------------"
+
+for summit_file in /data/mshe/rloopData/q0_01_macs3_results_*/*_peaks.narrowPeak; do
+    sample=$(basename "$summit_file" _q0_01_nomodel.macs3_peaks.narrowPeak)
+    peak_count=$(awk '!/^#/ && !/^$/ {count++} END {print count}' "$summit_file")
+    
+    # 判断样本类型
+    if [[ "$sample" == *"input"* ]]; then
+        type="Input"
+    elif [[ "$sample" == *"IP"* ]]; then
+        type="IP"
+    else
+        type="Unknown"
+    fi
+    
+    printf "%-30s %-10s %-10s\n" "$sample" "$peak_count" "$type"
+done | sort -k2 -nr  # 按peak数量降序排列
+
+
+echo "=== bedtools的Overlap分析 ==="
+printf "%-25s %-8s %-8s %-8s %-8s %-8s %-15s %-15s %-15s\n" \
+    "Condition" "Rep1" "Rep2" "Strict" "50bp" "100bp" "Strict(%)" "50bp(%)" "100bp(%)"
+echo "--------------------------------------------------------------------------------------------------------"
+
+for variety in HC22 HH43 HX3 Wm82 ZH13; do
+    # Input重复
+    rep1="/data/mshe/rloopData/q0_01_macs3_results_full/${variety}-1-input_x800_bw2_q0_01_nomodel.macs3_summits.bed"
+    rep2="/data/mshe/rloopData/q0_01_macs3_results_full/${variety}-2-input_x800_bw2_q0_01_nomodel.macs3_summits.bed"
+    
+    if [ -f "$rep1" ] && [ -f "$rep2" ]; then
+        rep1_count=$(wc -l < "$rep1")
+        rep2_count=$(wc -l < "$rep2")
+        
+        # 计算两种方向的overlap
+        # a vs b: Rep1中与Rep2重叠的
+        strict_ab=$(bedtools intersect -a "$rep1" -b "$rep2" -wa -u | wc -l)
+        window50_ab=$(bedtools window -a "$rep1" -b "$rep2" -w 50 -u | wc -l)
+        window100_ab=$(bedtools window -a "$rep1" -b "$rep2" -w 100 -u | wc -l)
+        
+        # b vs a: Rep2中与Rep1重叠的
+        strict_ba=$(bedtools intersect -a "$rep2" -b "$rep1" -wa -u | wc -l)
+        window50_ba=$(bedtools window -a "$rep2" -b "$rep1" -w 50 -u | wc -l)
+        window100_ba=$(bedtools window -a "$rep2" -b "$rep1" -w 100 -u | wc -l)
+        
+        # 计算比例
+        if [ $rep1_count -gt 0 ]; then
+            strict_ratio_ab=$(awk -v s=$strict_ab -v r1=$rep1_count 'BEGIN {printf "%.2f", s*100/r1}')
+            window50_ratio_ab=$(awk -v w=$window50_ab -v r1=$rep1_count 'BEGIN {printf "%.2f", w*100/r1}')
+            window100_ratio_ab=$(awk -v w=$window100_ab -v r1=$rep1_count 'BEGIN {printf "%.2f", w*100/r1}')
+        else
+            strict_ratio_ab="0.00"
+            window50_ratio_ab="0.00"
+            window100_ratio_ab="0.00"
+        fi
+        
+        if [ $rep2_count -gt 0 ]; then
+            strict_ratio_ba=$(awk -v s=$strict_ba -v r2=$rep2_count 'BEGIN {printf "%.2f", s*100/r2}')
+            window50_ratio_ba=$(awk -v w=$window50_ba -v r2=$rep2_count 'BEGIN {printf "%.2f", w*100/r2}')
+            window100_ratio_ba=$(awk -v w=$window100_ba -v r2=$rep2_count 'BEGIN {printf "%.2f", w*100/r2}')
+        else
+            strict_ratio_ba="0.00"
+            window50_ratio_ba="0.00"
+            window100_ratio_ba="0.00"
+        fi
+        
+        # 格式化为 a%/b%
+        strict_ratio="${strict_ratio_ab}%/${strict_ratio_ba}%"
+        window50_ratio="${window50_ratio_ab}%/${window50_ratio_ba}%"
+        window100_ratio="${window100_ratio_ab}%/${window100_ratio_ba}%"
+        
+        # 显示overlap总数（使用a vs b的结果，因为两者应该相同）
+        strict_total=$strict_ab
+        window50_total=$window50_ab
+        window100_total=$window100_ab
+        
+        printf "%-25s %-8s %-8s %-8s %-8s %-8s %-15s %-15s %-15s\n" \
+            "${variety}-input" "$rep1_count" "$rep2_count" "$strict_total" "$window50_total" "$window100_total" \
+            "$strict_ratio" "$window50_ratio" "$window100_ratio"
+    fi
+
+    # IP重复
+    rep1="/data/mshe/rloopData/q0_01_macs3_results_full/${variety}-1-IP_x800_bw2_q0_01_nomodel.macs3_summits.bed"
+    rep2="/data/mshe/rloopData/q0_01_macs3_results_full/${variety}-2-IP_x800_bw2_q0_01_nomodel.macs3_summits.bed"
+    
+    if [ -f "$rep1" ] && [ -f "$rep2" ]; then
+        rep1_count=$(wc -l < "$rep1")
+        rep2_count=$(wc -l < "$rep2")
+        
+        # 计算两种方向的overlap
+        # a vs b: Rep1中与Rep2重叠的
+        strict_ab=$(bedtools intersect -a "$rep1" -b "$rep2" -wa -u | wc -l)
+        window50_ab=$(bedtools window -a "$rep1" -b "$rep2" -w 50 -u | wc -l)
+        window100_ab=$(bedtools window -a "$rep1" -b "$rep2" -w 100 -u | wc -l)
+        
+        # b vs a: Rep2中与Rep1重叠的
+        strict_ba=$(bedtools intersect -a "$rep2" -b "$rep1" -wa -u | wc -l)
+        window50_ba=$(bedtools window -a "$rep2" -b "$rep1" -w 50 -u | wc -l)
+        window100_ba=$(bedtools window -a "$rep2" -b "$rep1" -w 100 -u | wc -l)
+        
+        # 计算比例
+        if [ $rep1_count -gt 0 ]; then
+            strict_ratio_ab=$(awk -v s=$strict_ab -v r1=$rep1_count 'BEGIN {printf "%.2f", s*100/r1}')
+            window50_ratio_ab=$(awk -v w=$window50_ab -v r1=$rep1_count 'BEGIN {printf "%.2f", w*100/r1}')
+            window100_ratio_ab=$(awk -v w=$window100_ab -v r1=$rep1_count 'BEGIN {printf "%.2f", w*100/r1}')
+        else
+            strict_ratio_ab="0.00"
+            window50_ratio_ab="0.00"
+            window100_ratio_ab="0.00"
+        fi
+        
+        if [ $rep2_count -gt 0 ]; then
+            strict_ratio_ba=$(awk -v s=$strict_ba -v r2=$rep2_count 'BEGIN {printf "%.2f", s*100/r2}')
+            window50_ratio_ba=$(awk -v w=$window50_ba -v r2=$rep2_count 'BEGIN {printf "%.2f", w*100/r2}')
+            window100_ratio_ba=$(awk -v w=$window100_ba -v r2=$rep2_count 'BEGIN {printf "%.2f", w*100/r2}')
+        else
+            strict_ratio_ba="0.00"
+            window50_ratio_ba="0.00"
+            window100_ratio_ba="0.00"
+        fi
+        
+        # 格式化为 a%/b%
+        strict_ratio="${strict_ratio_ab}%/${strict_ratio_ba}%"
+        window50_ratio="${window50_ratio_ab}%/${window50_ratio_ba}%"
+        window100_ratio="${window100_ratio_ab}%/${window100_ratio_ba}%"
+        
+        # 显示overlap总数（使用a vs b的结果，因为两者应该相同）
+        strict_total=$strict_ab
+        window50_total=$window50_ab
+        window100_total=$window100_ab
+        
+        printf "%-25s %-8s %-8s %-8s %-8s %-8s %-15s %-15s %-15s\n" \
+            "${variety}-IP" "$rep1_count" "$rep2_count" "$strict_total" "$window50_total" "$window100_total" \
+            "$strict_ratio" "$window50_ratio" "$window100_ratio"
+    fi
+done
+
+# deeptools可视化（仅绘制热图）
+vim deeptools_four_panel_full.sh
+#!/bin/bash
+
+DEEPTOOLS_DIR="/data/mshe/rloopData/deeptools/four_panel"
+BIGWIG_DIR="/data/mshe/rloopData/deeptools/bigwigs"
+REGIONS_DIR="/data/mshe/rloopData/q0_01_macs3_results_full"
+mkdir -p "$DEEPTOOLS_DIR"
+
+# 使用HX3-IP的peak作为参考区域（重复性最好）
+awk -v OFS='\t' '{print $1, $2-2000, $3+2000, $4, $5}' "${REGIONS_DIR}/HX3-1-IP_x800_bw2_q0_01_nomodel.macs3_summits.bed" > "${DEEPTOOLS_DIR}/HX3_reference_regions_2kb.bed"
+REF_PEAKS="${DEEPTOOLS_DIR}/HX3_reference_regions_2kb.bed"
+
+# 为每个品种创建四面板热图
+for variety in HC22 HH43 HX3 Wm82 ZH13; do
+    echo "处理品种: $variety"
+    
+    # 定义四个样本的bigWig文件
+    declare -a bw_files=(
+        "${BIGWIG_DIR}/${variety}-1-input_x800_full.bw"
+        "${BIGWIG_DIR}/${variety}-2-input_x800_full.bw"
+        "${BIGWIG_DIR}/${variety}-1-IP_x800_full.bw" 
+        "${BIGWIG_DIR}/${variety}-2-IP_x800_full.bw"
+    )
+    
+    # 样本标签
+    declare -a sample_labels=(
+        "${variety}-Input-Rep1"
+        "${variety}-Input-Rep2" 
+        "${variety}-IP-Rep1"
+        "${variety}-IP-Rep2"
+    )
+    
+    # 计算矩阵
+    computeMatrix reference-point \
+        --referencePoint center \
+        -b 2000 -a 2000 \
+        -R "$REF_PEAKS" \
+        -S "${bw_files[@]}" \
+        --missingDataAsZero \
+	-p 10 \
+        -o "${DEEPTOOLS_DIR}/${variety}_four_panel_matrix.gz" \
+        --outFileNameMatrix "${DEEPTOOLS_DIR}/${variety}_four_panel_matrix.tab" \
+        --outFileSortedRegions "${DEEPTOOLS_DIR}/${variety}_four_panel_regions.bed"
+    
+    # 检查矩阵是否成功生成
+    if [ ! -f "${DEEPTOOLS_DIR}/${variety}_four_panel_matrix.gz" ]; then
+        echo "错误: 矩阵生成失败 - ${variety}"
+        continue
+    fi
+
+    # 绘制四面板热图
+    plotHeatmap \
+        -m "${DEEPTOOLS_DIR}/${variety}_four_panel_matrix.gz" \
+        -o "${DEEPTOOLS_DIR}/${variety}_four_panel_heatmap.pdf" \
+        --colorMap Blues \
+        --whatToShow 'heatmap and colorbar' \
+        --samplesLabel "${sample_labels[@]}" \
+        --plotTitle "${variety} R-loop Signal" \
+        --refPointLabel "Summit" \
+        --legendLocation "upper-right" \
+        --xAxisLabel "Distance from summit (bp)" \
+        --yAxisLabel "" \
+        --perGroup \
+	--dpi 300
+done
+
+chmod u+x deeptools_four_panel_full.sh
+./deeptools_four_panel_full.sh
+
+
+vim deeptools_four_panel_wRloop.sh
+#!/bin/bash
+
+DEEPTOOLS_DIR="/data/mshe/rloopData/deeptools/four_panel_wRloop"
+BIGWIG_DIR="/data/mshe/rloopData/deeptools/bigwigs"
+REGIONS_DIR="/data/mshe/rloopData/q0_01_macs3_results_wRloop"
+mkdir -p "$DEEPTOOLS_DIR"
+
+# wRloop的HX3-1-IP作为参考区域
+awk -v OFS='\t' '{if($2-2000 < 0) $2=0; else $2=$2-2000; $3=$3+2000; print $1, $2, $3, $4, $5}' \
+    "${REGIONS_DIR}/HX3-1-IP_x800_bw2_wRloop_q0_01_nomodel.macs3_summits.bed" \
+    > "${DEEPTOOLS_DIR}/HX3_wRloop_reference_regions_2kb.bed"
+REF_PEAKS="${DEEPTOOLS_DIR}/HX3_wRloop_reference_regions_2kb.bed"
+# 为每个品种创建四面板热图
+for variety in HC22 HH43 HX3 Wm82 ZH13; do
+    echo "处理品种: $variety"
+    
+    # 定义四个样本的bigWig文件
+    declare -a bw_files=(
+        "${BIGWIG_DIR}/${variety}-1-input_x800_wRloop.bw"
+        "${BIGWIG_DIR}/${variety}-2-input_x800_wRloop.bw"
+        "${BIGWIG_DIR}/${variety}-1-IP_x800_wRloop.bw" 
+        "${BIGWIG_DIR}/${variety}-2-IP_x800_wRloop.bw"
+    )
+    
+    # 样本标签
+    declare -a sample_labels=(
+        "${variety}-Input-Rep1"
+        "${variety}-Input-Rep2" 
+        "${variety}-IP-Rep1"
+        "${variety}-IP-Rep2"
+    )
+    
+    # 计算矩阵
+    computeMatrix reference-point \
+        --referencePoint center \
+        -b 2000 -a 2000 \
+        -R "$REF_PEAKS" \
+        -S "${bw_files[@]}" \
+        --missingDataAsZero \
+	    -p 10 \
+        -o "${DEEPTOOLS_DIR}/${variety}_four_panel_wRloop_matrix.gz" \
+        --outFileNameMatrix "${DEEPTOOLS_DIR}/${variety}_four_panel_wRloop_matrix.tab" \
+        --outFileSortedRegions "${DEEPTOOLS_DIR}/${variety}_four_panel_wRloop_regions.bed"
+    
+    # 检查矩阵是否成功生成
+    if [ ! -f "${DEEPTOOLS_DIR}/${variety}_four_panel_wRloop_matrix.gz" ]; then
+        echo "错误: 矩阵生成失败 - ${variety}"
+        continue
+    fi
+
+    # 绘制四面板热图
+    plotHeatmap \
+        -m "${DEEPTOOLS_DIR}/${variety}_four_panel_wRloop_matrix.gz" \
+        -o "${DEEPTOOLS_DIR}/${variety}_four_panel_wRloop_heatmap.pdf" \
+        --colorMap Blues \
+        --whatToShow 'heatmap and colorbar' \
+        --samplesLabel "${sample_labels[@]}" \
+        --plotTitle "${variety} wRloop Signal" \
+        --refPointLabel "Summit" \
+        --legendLocation "upper-right" \
+        --xAxisLabel "Distance from summit (bp)" \
+        --yAxisLabel "" \
+        --perGroup \
+	--dpi 300
+done
+
+chmod u+x deeptools_four_panel_wRloop.sh
+./deeptools_four_panel_wRloop.sh
+
+
+vim deeptools_four_panel_cRloop.sh
+#!/bin/bash
+
+DEEPTOOLS_DIR="/data/mshe/rloopData/deeptools/four_panel_cRloop"
+BIGWIG_DIR="/data/mshe/rloopData/deeptools/bigwigs"
+REGIONS_DIR="/data/mshe/rloopData/q0_01_macs3_results_cRloop"
+mkdir -p "$DEEPTOOLS_DIR"
+
+# cRloop的HX3-1-IP作为参考区域
+awk -v OFS='\t' '{if($2-2000 < 0) $2=0; else $2=$2-2000; $3=$3+2000; print $1, $2, $3, $4, $5}' \
+    "${REGIONS_DIR}/HX3-1-IP_x800_bw2_cRloop_q0_01_nomodel.macs3_summits.bed" \
+    > "${DEEPTOOLS_DIR}/HX3_cRloop_reference_regions_2kb.bed"
+REF_PEAKS="${DEEPTOOLS_DIR}/HX3_cRloop_reference_regions_2kb.bed"
+# 为每个品种创建四面板热图
+for variety in HC22 HH43 HX3 Wm82 ZH13; do
+    echo "处理品种: $variety"
+    
+    # 定义四个样本的bigWig文件
+    declare -a bw_files=(
+        "${BIGWIG_DIR}/${variety}-1-input_x800_cRloop.bw"
+        "${BIGWIG_DIR}/${variety}-2-input_x800_cRloop.bw"
+        "${BIGWIG_DIR}/${variety}-1-IP_x800_cRloop.bw" 
+        "${BIGWIG_DIR}/${variety}-2-IP_x800_cRloop.bw"
+    )
+    
+    # 样本标签
+    declare -a sample_labels=(
+        "${variety}-Input-Rep1"
+        "${variety}-Input-Rep2" 
+        "${variety}-IP-Rep1"
+        "${variety}-IP-Rep2"
+    )
+    
+    # 计算矩阵
+    computeMatrix reference-point \
+        --referencePoint center \
+        -b 2000 -a 2000 \
+        -R "$REF_PEAKS" \
+        -S "${bw_files[@]}" \
+        --missingDataAsZero \
+	    -p 10 \
+        -o "${DEEPTOOLS_DIR}/${variety}_four_panel_cRloop_matrix.gz" \
+        --outFileNameMatrix "${DEEPTOOLS_DIR}/${variety}_four_panel_cRloop_matrix.tab" \
+        --outFileSortedRegions "${DEEPTOOLS_DIR}/${variety}_four_panel_cRloop_regions.bed"
+    
+    # 检查矩阵是否成功生成
+    if [ ! -f "${DEEPTOOLS_DIR}/${variety}_four_panel_cRloop_matrix.gz" ]; then
+        echo "错误: 矩阵生成失败 - ${variety}"
+        continue
+    fi
+
+    # 绘制四面板热图
+    plotHeatmap \
+        -m "${DEEPTOOLS_DIR}/${variety}_four_panel_cRloop_matrix.gz" \
+        -o "${DEEPTOOLS_DIR}/${variety}_four_panel_cRloop_heatmap.pdf" \
+        --colorMap Blues \
+        --whatToShow 'heatmap and colorbar' \
+        --samplesLabel "${sample_labels[@]}" \
+        --plotTitle "${variety} cRloop Signal" \
+        --refPointLabel "Summit" \
+        --legendLocation "upper-right" \
+        --xAxisLabel "Distance from summit (bp)" \
+        --yAxisLabel "" \
+        --perGroup \
+	--dpi 300
+done
+
+chmod u+x deeptools_four_panel_cRloop.sh
+./deeptools_four_panel_cRloop.sh
+
+intervene venn -i /data/mshe/rloopData/q0_01_macs3_results_wRloop/HC22-1-IP_x800_bw2_wRloop_q0_01_nomodel.macs3_peaks.narrowPeak \
+/data/mshe/rloopData/q0_01_macs3_results_wRloop/HC22-2-IP_x800_bw2_wRloop_q0_01_nomodel.macs3_peaks.narrowPeak \
+/data/mshe/rloopData/q0_01_macs3_results_cRloop/HC22-1-IP_x800_bw2_cRloop_q0_01_nomodel.macs3_peaks.narrowPeak \
+/data/mshe/rloopData/q0_01_macs3_results_cRloop/HC22-2-IP_x800_bw2_cRloop_q0_01_nomodel.macs3_peaks.narrowPeak \
+--names wRloop_rep1,wRloop_rep2,cRloop_rep1,cRloop_rep2 --output intervene_results --figtype pdf --dpi 300
+mv /data/mshe/rloopData/intervene_results/Intervene_venn.pdf /data/mshe/rloopData/intervene_results/HC22-IP_wRloop_cRloop_venn.pdf
+intervene venn -i /data/mshe/rloopData/q0_01_macs3_results_wRloop/HH43-1-IP_x800_bw2_wRloop_q0_01_nomodel.macs3_peaks.narrowPeak \
+/data/mshe/rloopData/q0_01_macs3_results_wRloop/HH43-2-IP_x800_bw2_wRloop_q0_01_nomodel.macs3_peaks.narrowPeak \
+/data/mshe/rloopData/q0_01_macs3_results_cRloop/HH43-1-IP_x800_bw2_cRloop_q0_01_nomodel.macs3_peaks.narrowPeak \
+/data/mshe/rloopData/q0_01_macs3_results_cRloop/HH43-2-IP_x800_bw2_cRloop_q0_01_nomodel.macs3_peaks.narrowPeak \
+--names wRloop_rep1,wRloop_rep2,cRloop_rep1,cRloop_rep2 --output intervene_results --figtype pdf --dpi 300
+mv /data/mshe/rloopData/intervene_results/Intervene_venn.pdf /data/mshe/rloopData/intervene_results/HH43-IP_wRloop_cRloop_venn.pdf
+intervene venn -i /data/mshe/rloopData/q0_01_macs3_results_wRloop/HX3-1-IP_x800_bw2_wRloop_q0_01_nomodel.macs3_peaks.narrowPeak \
+/data/mshe/rloopData/q0_01_macs3_results_wRloop/HX3-2-IP_x800_bw2_wRloop_q0_01_nomodel.macs3_peaks.narrowPeak \
+/data/mshe/rloopData/q0_01_macs3_results_cRloop/HX3-1-IP_x800_bw2_cRloop_q0_01_nomodel.macs3_peaks.narrowPeak \
+/data/mshe/rloopData/q0_01_macs3_results_cRloop/HX3-2-IP_x800_bw2_cRloop_q0_01_nomodel.macs3_peaks.narrowPeak \
+--names wRloop_rep1,wRloop_rep2,cRloop_rep1,cRloop_rep2 --output intervene_results --figtype pdf --dpi 300
+mv /data/mshe/rloopData/intervene_results/Intervene_venn.pdf /data/mshe/rloopData/intervene_results/HX3-IP_wRloop_cRloop_venn.pdf
+intervene venn -i /data/mshe/rloopData/q0_01_macs3_results_wRloop/Wm82-1-IP_x800_bw2_wRloop_q0_01_nomodel.macs3_peaks.narrowPeak \
+/data/mshe/rloopData/q0_01_macs3_results_wRloop/Wm82-2-IP_x800_bw2_wRloop_q0_01_nomodel.macs3_peaks.narrowPeak \
+/data/mshe/rloopData/q0_01_macs3_results_cRloop/Wm82-1-IP_x800_bw2_cRloop_q0_01_nomodel.macs3_peaks.narrowPeak \
+/data/mshe/rloopData/q0_01_macs3_results_cRloop/Wm82-2-IP_x800_bw2_cRloop_q0_01_nomodel.macs3_peaks.narrowPeak \
+--names wRloop_rep1,wRloop_rep2,cRloop_rep1,cRloop_rep2 --output intervene_results --figtype pdf --dpi 300
+mv /data/mshe/rloopData/intervene_results/Intervene_venn.pdf /data/mshe/rloopData/intervene_results/Wm82-IP_wRloop_cRloop_venn.pdf
+intervene venn -i /data/mshe/rloopData/q0_01_macs3_results_wRloop/ZH13-1-IP_x800_bw2_wRloop_q0_01_nomodel.macs3_peaks.narrowPeak \
+/data/mshe/rloopData/q0_01_macs3_results_wRloop/ZH13-2-IP_x800_bw2_wRloop_q0_01_nomodel.macs3_peaks.narrowPeak \
+/data/mshe/rloopData/q0_01_macs3_results_cRloop/ZH13-1-IP_x800_bw2_cRloop_q0_01_nomodel.macs3_peaks.narrowPeak \
+/data/mshe/rloopData/q0_01_macs3_results_cRloop/ZH13-2-IP_x800_bw2_cRloop_q0_01_nomodel.macs3_peaks.narrowPeak \
+--names wRloop_rep1,wRloop_rep2,cRloop_rep1,cRloop_rep2 --output intervene_results --figtype pdf --dpi 300
+mv /data/mshe/rloopData/intervene_results/Intervene_venn.pdf /data/mshe/rloopData/intervene_results/ZH13-IP_wRloop_cRloop_venn.pdf
+
+
+vim create_all_genes_bed.sh
+#!/bin/bash
+#只有基因的bed
+GFF_FILE="/data/mshe/rloopData/Gmax_508_Wm82.a4.v1.gene.gff3"
+ANNOTATION_DIR="/data/mshe/rloopData/annotation"
+mkdir -p "$ANNOTATION_DIR"
+out="${ANNOTATION_DIR}/genes.bed"
+awk '$3=="gene" {
+    # 1-based GFF -> BED start = start-1
+    id="."
+    n=split($9, a, ";")
+    for(i=1;i<=n;i++){
+        if(a[i] ~ /^ID=/){ split(a[i],b,"="); id=b[2]; break }
+        if(a[i] ~ /^Name=/){ split(a[i],b,"="); id=b[2] } 
+    }
+    if(id=="" || id==".") id="gene"
+    print $1, $4-1, $5, id, 0, $7
+}' OFS="\t" "$GFF_FILE" > "$out"
+echo "Done. 输出行数: $(wc -l < "$out")"
+awk 'BEGIN { OFS="\t" }
+{
+    sub(/_scaffold.*/, "", $1);   # 删除_scaffold之后内容
+    gsub(/\r/, "");               # 清除隐藏的\r
+    $1=$1;                        
+    print
+}
+'  "/data/mshe/rloopData/annotation/genes.bed" > "/data/mshe/rloopData/annotation/genes_fixed.bed"
+  awk '$6=="+"' "/data/mshe/rloopData/annotation/genes_fixed.bed" > "/data/mshe/rloopData/annotation/genes_plus1.bed"
+  awk '$6=="-"' "/data/mshe/rloopData/annotation/genes_fixed.bed" > "/data/mshe/rloopData/annotation/genes_minus1.bed"
+# 生成基因间区域bed文件
+samtools faidx Gmax_508_v4.0.fa
+cut -f1 "/data/mshe/rloopData/Gmax_508_v4.0.fa.fai" > "/data/mshe/rloopData/chromosome_order.txt"
+# 首先合并所有基因区域（包括sense和antisense）
+cat "/data/mshe/rloopData/annotation/genes_plus1.bed" "/data/mshe/rloopData/annotation/genes_minus1.bed" | sort -k1,1 -k2,2n | bedtools sort -g "/data/mshe/rloopData/chromosome_order.txt" > "/data/mshe/rloopData/annotation/all_genes_combined_sorted1.bed"
+# 用bedtools complement获取基因间区域，需要基因组fai文件来定义染色体边界，需要排序的bed文件
+bedtools complement -i "/data/mshe/rloopData/annotation/all_genes_combined_sorted1.bed" -g "/data/mshe/rloopData/Gmax_508_v4.0.fa.fai" > "/data/mshe/rloopData/annotation/intergenic_regions1.bed"
+echo "sense基因数量: $(wc -l < "/data/mshe/rloopData/annotation/genes_plus1.bed")"
+echo "antisense基因数量: $(wc -l < "/data/mshe/rloopData/annotation/genes_minus1.bed")" 
+echo "intergenic区域数量: $(wc -l < "/data/mshe/rloopData/annotation/intergenic_regions1.bed")"
+
+chmod u+x create_all_genes_bed.sh
+./create_all_genes_bed.sh
+
+
+vim final_sense_anti_bam.sh
+#!/bin/bash
+set -euo pipefail
+
+ANNOT_DIR="/data/mshe/rloopData/annotation"
+GENES_PLUS="${ANNOT_DIR}/genes_plus1.bed"
+GENES_MINUS="${ANNOT_DIR}/genes_minus1.bed"
+BAM_DIR="/data/mshe/rloopData/merge_rep_bam_wcRloop"
+OUT_DIR="/data/mshe/rloopData/final_sense_anti_bam"
+mkdir -p "$OUT_DIR"
+
+varieties=("HC22" "HH43" "HX3" "Wm82" "ZH13")
+types=("IP" "input")
+
+for var in "${varieties[@]}"; do
+  for t in "${types[@]}"; do
+    echo "=== 处理 ${var} ${t} ==="
+    # 指定 wRloop / cRloop 文件名格式
+    wfile="${BAM_DIR}/${var}_${t}_wRloop.merged.bam"
+    cfile="${BAM_DIR}/${var}_${t}_cRloop.merged.bam"
+    out_sense="${OUT_DIR}/${var}_${t}_sense_final.bam"
+    out_anti="${OUT_DIR}/${var}_${t}_antisense_final.bam"
+    out_intergenic="${OUT_DIR}/${var}_${t}_intergenic.bam"
+
+    # 临时中间文件
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    parts=()
+    intergenic_parts=()
+
+    #  wRloop + genes_plus => sense ; wRloop + genes_minus => antisense
+    if [ -f "$wfile" ]; then
+      echo "  处理 wRloop: $wfile"
+      bedtools intersect -abam "$wfile" -b "$GENES_PLUS" -wa -u > "${tmpdir}/w_plus.bam"
+      bedtools intersect -abam "$wfile" -b "$GENES_MINUS" -wa -u > "${tmpdir}/w_minus.bam"
+      # 计算 intergenic
+      bedtools intersect -abam "$wfile" -v -b "$GENES_PLUS" -v -b "$GENES_MINUS" -wa > "${tmpdir}/w_intergenic.bam"
+      # append to lists
+      parts+=("${tmpdir}/w_plus.bam::sense" "${tmpdir}/w_minus.bam::anti")
+      intergenic_parts+=("${tmpdir}/w_intergenic.bam")
+    else
+      echo "  没有找到 $wfile ，跳过 wRloop"
+    fi
+
+    #  cRloop + genes_minus => sense ; cRloop + genes_plus => antisense
+    if [ -f "$cfile" ]; then
+      echo "  处理 cRloop: $cfile"
+      bedtools intersect -abam "$cfile" -b "$GENES_MINUS" -wa -u > "${tmpdir}/c_minus.bam"
+      bedtools intersect -abam "$cfile" -b "$GENES_PLUS" -wa -u > "${tmpdir}/c_plus.bam"
+      # 计算 intergenic
+      bedtools intersect -abam "$cfile" -v -b "$GENES_PLUS" -v -b "$GENES_MINUS" -wa > "${tmpdir}/c_intergenic.bam"
+      parts+=("${tmpdir}/c_minus.bam::sense" "${tmpdir}/c_plus.bam::anti")
+      intergenic_parts+=("${tmpdir}/c_intergenic.bam")
+    else
+      echo "  没有找到 $cfile ，跳过 cRloop"
+    fi
+
+    # 合并 sense parts
+    sense_parts=()
+    anti_parts=()
+    for p in "${parts[@]}"; do
+      file="${p%%::*}"
+      tag="${p##*::}"
+      if [ "$tag" == "sense" ]; then
+        # file may be empty - only add if non-empty
+        if [ -s "$file" ]; then sense_parts+=("$file"); fi
+      else
+        if [ -s "$file" ]; then anti_parts+=("$file"); fi
+      fi
+    done
+
+    # 合并并写入最终 bam
+    if [ ${#sense_parts[@]} -gt 0 ]; then
+      echo "  合并 sense (${#sense_parts[@]})"
+      samtools merge -f "$out_sense" "${sense_parts[@]}"
+      samtools index "$out_sense"
+    else
+      echo "  没有 sense reads，跳过生成 $out_sense"
+    fi
+
+    if [ ${#anti_parts[@]} -gt 0 ]; then
+      echo "  合并 antisense (${#anti_parts[@]})"
+      samtools merge -f "$out_anti" "${anti_parts[@]}"
+      samtools index "$out_anti"
+    else
+      echo "  没有 antisense reads，跳过生成 $out_anti"
+    fi
+
+    # 合并 intergenic parts
+    if [ ${#intergenic_parts[@]} -gt 0 ]; then
+      echo "  合并 intergenic (${#intergenic_parts[@]})"
+      samtools merge -f "$out_intergenic" "${intergenic_parts[@]}"
+      samtools index "$out_intergenic"
+    else
+      echo "  没有 intergenic reads，跳过生成 $out_intergenic"
+    fi
+
+    # 清理 trap 会删除临时目录
+    trap - EXIT
+    rm -rf "$tmpdir"
+  done
+done
+echo "全部完成。输出目录: $OUT_DIR"
+
+chmod u+x final_sense_anti_bam.sh
+nohup ./final_sense_anti_bam.sh > final_sense_anti_bam.log 2>&1 &
+
+
+vim sense_anti_classify.sh
+#!/bin/bash
+
+WRLOOP_DIR="/data/mshe/rloopData/q0_01_macs3_results_wRloop"
+CRLOOP_DIR="/data/mshe/rloopData/q0_01_macs3_results_cRloop"
+ANNOTATION_DIR="/data/mshe/rloopData/annotation"
+OUTPUT_DIR="/data/mshe/rloopData/strand_specific_peaks"
+mkdir -p "$OUTPUT_DIR"
+
+# 为每个品种分类sense和anti peaks
+for wrloop_peaks in ${WRLOOP_DIR}/*_peaks.narrowPeak; do
+    sample=$(basename "$wrloop_peaks" _x800_bw2_wRloop_q0_01_nomodel.macs3_peaks.narrowPeak)
+    if [ ! -f "$wrloop_peaks" ]; then
+        echo "警告: wRloop peaks文件不存在 - $wrloop_peaks"
+        continue
+    fi
+  echo "处理wRloop样本: $sample"
+  echo "识别Sense R-loops..."
+    # wRloop + 正链基因 → sense
+    bedtools intersect -a "$wrloop_peaks" -b "${ANNOTATION_DIR}/genes_plus.bed" -wa -u > \
+        "${OUTPUT_DIR}/${sample}_x800_wRloop_sense.bed"
+    # wRloop + 负链基因 → anti-sense
+    bedtools intersect -a "$wrloop_peaks" -b "${ANNOTATION_DIR}/genes_minus.bed" -wa -u > \
+        "${OUTPUT_DIR}/${sample}_x800_wRloop_antisense.bed"
+    echo "  Sense: $(wc -l < ${OUTPUT_DIR}/${sample}_x800_wRloop_sense.bed)"
+    echo "  Anti-sense: $(wc -l < ${OUTPUT_DIR}/${sample}_x800_wRloop_antisense.bed)"
+done
+
+for crloop_peaks in ${CRLOOP_DIR}/*_peaks.narrowPeak; do
+    sample=$(basename "$crloop_peaks" _x800_bw2_cRloop_q0_01_nomodel.macs3_peaks.narrowPeak)
+    if [ ! -f "$crloop_peaks" ]; then
+        echo "警告: cRloop peaks文件不存在 - $crloop_peaks"
+        continue
+    fi
+  echo "处理cRloop样本: $sample"
+  echo "识别Sense R-loops..."
+    # cRloop + 负链基因 → sense
+    bedtools intersect -a "$crloop_peaks" -b "${ANNOTATION_DIR}/genes_minus.bed" -wa -u > \
+        "${OUTPUT_DIR}/${sample}_x800_cRloop_sense.bed"
+    # cRloop + 正链基因 → anti-sense
+    bedtools intersect -a "$crloop_peaks" -b "${ANNOTATION_DIR}/genes_plus.bed" -wa -u > \
+        "${OUTPUT_DIR}/${sample}_x800_cRloop_antisense.bed"
+    echo "  Sense: $(wc -l < ${OUTPUT_DIR}/${sample}_x800_cRloop_sense.bed)"
+    echo "  Anti-sense: $(wc -l < ${OUTPUT_DIR}/${sample}_x800_cRloop_antisense.bed)"
+done
+
+# 然后按品种合并
+for variety in HC22 HH43 HX3 Wm82 ZH13; do
+    echo "合并品种: $variety"
+    
+    # 合并sense peaks
+    cat "${OUTPUT_DIR}/${variety}"-*-IP_x800_wRloop_sense.bed \
+        "${OUTPUT_DIR}/${variety}"-*-IP_x800_cRloop_sense.bed 2>/dev/null | \
+        sort -k1,1 -k2,2n | bedtools merge -i - > \
+        "${OUTPUT_DIR}/${variety}_IP_sense_peaks.bed"
+    
+    cat "${OUTPUT_DIR}/${variety}"-*-input_x800_wRloop_sense.bed \
+        "${OUTPUT_DIR}/${variety}"-*-input_x800_cRloop_sense.bed 2>/dev/null | \
+        sort -k1,1 -k2,2n | bedtools merge -i - > \
+        "${OUTPUT_DIR}/${variety}_input_sense_peaks.bed"
+    # 合并anti-sense peaks
+    cat "${OUTPUT_DIR}/${variety}"-*-IP_x800_wRloop_antisense.bed \
+        "${OUTPUT_DIR}/${variety}"-*-IP_x800_cRloop_antisense.bed 2>/dev/null | \
+        sort -k1,1 -k2,2n | bedtools merge -i - > \
+        "${OUTPUT_DIR}/${variety}_IP_antisense_peaks.bed"
+    
+    cat "${OUTPUT_DIR}/${variety}"-*-input_x800_wRloop_antisense.bed \
+        "${OUTPUT_DIR}/${variety}"-*-input_x800_cRloop_antisense.bed 2>/dev/null | \
+        sort -k1,1 -k2,2n | bedtools merge -i - > \
+        "${OUTPUT_DIR}/${variety}_input_antisense_peaks.bed"
+
+    sense_IP_count=$(wc -l < "${OUTPUT_DIR}/${variety}_IP_sense_peaks.bed")
+    antisense_IP_count=$(wc -l < "${OUTPUT_DIR}/${variety}_IP_antisense_peaks.bed")
+    sense_input_count=$(wc -l < "${OUTPUT_DIR}/${variety}_input_sense_peaks.bed")
+    antisense_input_count=$(wc -l < "${OUTPUT_DIR}/${variety}_input_antisense_peaks.bed")
+
+    
+    echo "  Sense IP peaks: $sense_IP_count"
+    echo "  Anti-sense IP peaks: $antisense_IP_count"
+    echo "  Sense input peaks: $sense_input_count"
+    echo "  Anti-sense input peaks: $antisense_input_count"
+done
+
+chmod u+x sense_anti_classify.sh
+nohup ./sense_anti_classify.sh > sense_anti_classify.log 2>&1 &
+
+vim sense_anti_plot.sh
+#!/bin/bash
+
+DEEPTOOLS_DIR="/data/mshe/rloopData/deeptools/sense_anti_plot"
+BIGWIG_DIR="/data/mshe/rloopData/deeptools/bigwigs"
+PEAKS_DIR="/data/mshe/rloopData/strand_specific_peaks"
+mkdir -p "$DEEPTOOLS_DIR"
+
+# 先测试一个品种
+for variety in HC22 HH43 HX3 Wm82 ZH13; do
+    echo "处理品种: $variety"
+    
+    # 检查sense和anti peaks文件
+    if [ ! -f "${PEAKS_DIR}/${variety}_IP_sense_peaks.bed" ] || [ ! -f "${PEAKS_DIR}/${variety}_IP_antisense_peaks.bed" ]; then
+        echo "错误: 缺少sense或anti peaks文件 - ${variety}"
+        continue
+    fi
+    
+    # 准备参考区域（扩展为±2kb）
+    echo "准备参考区域..."
+    awk -v OFS='\t' '{if($2-2000 < 0) $2=0; else $2=$2-2000; $3=$3+2000; print $1, $2, $3, "sense_peak_"NR, "."}' \
+        "${PEAKS_DIR}/${variety}_IP_sense_peaks.bed" > \
+        "${DEEPTOOLS_DIR}/${variety}_IP_sense_regions_2kb.bed"
+    
+    awk -v OFS='\t' '{if($2-2000 < 0) $2=0; else $2=$2-2000; $3=$3+2000; print $1, $2, $3, "antisense_peak_"NR, "."}' \
+        "${PEAKS_DIR}/${variety}_IP_antisense_peaks.bed" > \
+        "${DEEPTOOLS_DIR}/${variety}_IP_antisense_regions_2kb.bed"
+    
+    # Sense R-loop热图
+    echo "=== 生成Sense R-loop热图 ==="
+    computeMatrix reference-point \
+        --referencePoint center \
+        -b 2000 -a 2000 \
+        -R "${DEEPTOOLS_DIR}/${variety}_IP_sense_regions_2kb.bed" \
+        -S "${BIGWIG_DIR}/${variety}-1-IP_x800_full.bw" \
+           "${BIGWIG_DIR}/${variety}-2-IP_x800_full.bw" \
+        --missingDataAsZero \
+        -o "${DEEPTOOLS_DIR}/${variety}_IP_sense_matrix.gz" \
+        -p 8
+    
+    plotHeatmap \
+        -m "${DEEPTOOLS_DIR}/${variety}_IP_sense_matrix.gz" \
+        -o "${DEEPTOOLS_DIR}/${variety}_IP_sense_heatmap.pdf" \
+        --colorMap Blues \
+        --samplesLabel "${variety}-IP-Rep1" "${variety}-IP-Rep2" \
+        --plotTitle "${variety} Sense R-loops" \
+        --refPointLabel "Summit" \
+        --xAxisLabel "Distance from summit (bp)" \
+        --perGroup \
+        --dpi 300
+    
+    # Anti-sense R-loop热图
+    echo "=== 生成Anti-sense R-loop热图 ==="
+    computeMatrix reference-point \
+        --referencePoint center \
+        -b 2000 -a 2000 \
+        -R "${DEEPTOOLS_DIR}/${variety}_IP_antisense_regions_2kb.bed" \
+        -S "${BIGWIG_DIR}/${variety}-1-IP_x800_full.bw" \
+           "${BIGWIG_DIR}/${variety}-2-IP_x800_full.bw" \
+        --missingDataAsZero \
+        -o "${DEEPTOOLS_DIR}/${variety}_IP_antisense_matrix.gz" \
+        -p 8
+    
+    plotHeatmap \
+        -m "${DEEPTOOLS_DIR}/${variety}_IP_antisense_matrix.gz" \
+        -o "${DEEPTOOLS_DIR}/${variety}_IP_antisense_heatmap.pdf" \
+        --colorMap Blues \
+        --samplesLabel "${variety}-IP-Rep1" "${variety}-IP-Rep2" \
+        --plotTitle "${variety} Anti-sense R-loops" \
+        --refPointLabel "Summit" \
+        --xAxisLabel "Distance from summit (bp)" \
+        --perGroup \
+        --dpi 300
+    
+    echo "完成: ${variety}"
+done
+chmod u+x sense_anti_plot.sh
+./sense_anti_plot.sh
+
+
+#合并重复样本的bam
+vim merge_rep_bam.sh
+#!/bin/bash
+WRLOOP_DIR="/data/mshe/rloopData/bam_wRloop"
+CRLOOP_DIR="/data/mshe/rloopData/bam_cRloop"
+OUTPUT_DIR="/data/mshe/rloopData/merge_rep_bam"  #已更名为merge_rep_bam_wcRloop
+mkdir -p ${OUTPUT_DIR}
+
+varieties=("HC22" "HH43" "HX3" "Wm82" "ZH13")
+merge_samples() {
+    local base_dir=$1
+    local suffix=$2
+    
+    echo "正在处理目录: $base_dir"
+    
+    for variety in "${varieties[@]}"; do
+        echo "处理品种: $variety"
+        
+        # 合并IP样本
+        ip_files=()
+        for i in 1 2; do
+            file="${base_dir}/${variety}-${i}-IP_x800_${suffix}.sorted.bam"
+            if [[ -f "$file" ]]; then
+                ip_files+=("$file")
+            fi
+        done
+        
+        if [[ ${#ip_files[@]} -gt 0 ]]; then
+            echo "合并IP样本: ${ip_files[*]}"
+            samtools merge -@ 8 ${OUTPUT_DIR}/${variety}_IP_${suffix}.merged.bam ${ip_files[@]}
+            samtools index -@ 8 ${OUTPUT_DIR}/${variety}_IP_${suffix}.merged.bam
+        fi
+        
+        # 合并input样本
+        input_files=()
+        for i in 1 2; do
+            file="${base_dir}/${variety}-${i}-input_x800_${suffix}.sorted.bam"
+            if [[ -f "$file" ]]; then
+                input_files+=("$file")
+            fi
+        done
+        
+        if [[ ${#input_files[@]} -gt 0 ]]; then
+            echo "合并input样本: ${input_files[*]}"
+            samtools merge -@ 8 ${OUTPUT_DIR}/${variety}_input_${suffix}.merged.bam ${input_files[@]}
+            samtools index -@ 8 ${OUTPUT_DIR}/${variety}_input_${suffix}.merged.bam
+        fi
+    done
+}
+
+# 处理wRloop样本
+echo "=== 开始合并wRloop样本 ==="
+merge_samples "$WRLOOP_DIR" "wRloop"
+
+# 处理cRloop样本
+echo "=== 开始合并cRloop样本 ==="
+merge_samples "$CRLOOP_DIR" "cRloop"
+
+echo "=== 合并完成 ==="
+echo "输出目录: $OUTPUT_DIR"
+ls -la $OUTPUT_DIR
+chmod +x merge_rep_bam.sh
+./merge_rep_bam.sh
+
+vim macs3_peakcall_merge_wcRloop.sh
+#!/bin/bash
+echo "开始时间：$(date)"
+
+BAM_DIR="/data/mshe/rloopData/merge_rep_bam"  # 文件夹名字已更改为merge_rep_bam_wcRloop
+BW_DIR="/data/mshe/rloopData/merge_rep_bam/bigwigs"
+OUTPUT_DIR="/data/mshe/rloopData/macs3_results_merge_wcRloop"
+mkdir -p ${OUTPUT_DIR}
+mkdir -p ${BW_DIR}
+#生成bw文件
+for bam_file in ${BAM_DIR}/*.bam; do
+    if [ ! -f "$bam_file" ]; then
+        continue
+    fi
+    sample=$(basename "$bam_file" .merge.bam)
+    echo "生成 $sample.bw"
+    bamCoverage -b "$bam_file" \
+        -o "${BW_DIR}/${sample}.bw" \
+        --binSize 10 \
+        --normalizeUsing RPKM \
+        --numberOfProcessors 4
+done
+
+echo "wRloop peak calling..."
+for bam_file in ${BAM_DIR}/*_wRloop.merged.bam; do
+    sample=$(basename "$bam_file" _wRloop.merged.bam)  
+    
+    # 检查是否已经运行过
+    if [ -f "${OUTPUT_DIR}/${sample}_x800_bw2_wRloop_nomodel.macs3_peaks.xls" ]; then  
+        echo "跳过已处理的样本：$sample"
+        continue
+    fi
+    
+    echo "处理样本：$sample"
+    macs3 callpeak -t "$bam_file" \
+    --extsize 200 -q 0.05 \
+    --nomodel --SPMR -f BAM \
+    -g 1e+9 -B \
+    -n "${OUTPUT_DIR}/${sample}_x800_bw2_wRloop_nomodel.macs3"
+done
+
+echo "cRloop peak calling..."
+for bam_file in ${BAM_DIR}/*_cRloop.merged.bam; do
+    sample=$(basename "$bam_file" _cRloop.merged.bam)  
+    
+    # 检查是否已经运行过
+    if [ -f "${OUTPUT_DIR}/${sample}_x800_bw2_cRloop_nomodel.macs3_peaks.xls" ]; then  
+        echo "跳过已处理的样本：$sample"
+        continue
+    fi
+    
+    echo "处理样本：$sample"
+    macs3 callpeak -t "$bam_file" \
+    --extsize 200 -q 0.05 \
+    --nomodel --SPMR -f BAM \
+    -g 1e+9 -B \
+    -n "${OUTPUT_DIR}/${sample}_x800_bw2_cRloop_nomodel.macs3"
+done
+echo "结束时间：$(date)"
+chmod u+x macs3_peakcall_merge_wcRloop.sh
+./macs3_peakcall_merge_wcRloop.sh
+
+vim merge_macs3_full.sh
+#!/bin/bash
+# 设置路径
+PICARD_DIR="/data/mshe/rloopData/picard"
+MERGED_DIR="/data/mshe/rloopData/merged_bam_full"
+BW_DIR="/data/mshe/rloopData/merged_bam_full/bigwigs"
+PEAKS_DIR="/data/mshe/rloopData/macs3_results_merge_full"
+
+# 创建输出目录
+mkdir -p $MERGED_DIR $BW_DIR $PEAKS_DIR
+
+# 定义品种列表
+varieties=("HC22" "HH43" "HX3" "Wm82" "ZH13")
+echo "=== 开始合并重复样本 ==="
+    for variety in "${varieties[@]}"; do
+        echo "处理品种: $variety"
+        
+        # 合并IP样本
+        ip_files=()
+        for i in 1 2; do
+            file="${PICARD_DIR}/${variety}-${i}-IP_x800_picard.bam"
+            if [[ -f "$file" ]]; then
+                ip_files+=("$file")
+                echo "找到IP文件: $file"
+            else
+                echo "警告: 未找到文件 $file"
+            fi
+        done
+        
+        if [[ ${#ip_files[@]} -eq 2 ]]; then
+            echo "合并IP样本: ${ip_files[*]}"
+            samtools merge -f -@ 8 ${MERGED_DIR}/${variety}_IP_merged.bam ${ip_files[@]}
+            samtools index -@ 8 ${MERGED_DIR}/${variety}_IP_merged.bam
+            echo "已创建: ${MERGED_DIR}/${variety}_IP_merged.bam"
+        else
+            echo "错误: 找不到足够的IP文件 for $variety"
+        fi
+        
+        # 合并input样本
+        input_files=()
+        for i in 1 2; do
+            file="${PICARD_DIR}/${variety}-${i}-input_x800_picard.bam"
+            if [[ -f "$file" ]]; then
+                input_files+=("$file")
+                echo "找到input文件: $file"
+            else
+                echo "警告: 未找到文件 $file"
+            fi
+        done
+        
+        if [[ ${#input_files[@]} -eq 2 ]]; then
+            echo "合并input样本: ${input_files[*]}"
+            samtools merge -f -@ 8 ${MERGED_DIR}/${variety}_input_merged.bam ${input_files[@]}
+            samtools index -@ 8 ${MERGED_DIR}/${variety}_input_merged.bam
+            echo "已创建: ${MERGED_DIR}/${variety}_input_merged.bam"
+        else
+            echo "错误: 找不到足够的input文件 for $variety"
+        fi
+        echo "---"
+    done
+
+    echo "=== 开始生成bigWig文件 ==="
+    for variety in "${varieties[@]}"; do
+        echo "生成bw文件 for $variety"
+        
+        ip_bam="${MERGED_DIR}/${variety}_IP_merged.bam"
+        input_bam="${MERGED_DIR}/${variety}_input_merged.bam"
+        
+        if [[ -f "$ip_bam" ]]; then
+            bamCoverage -b $ip_bam \
+                -o ${BW_DIR}/${variety}_IP_full.bw \
+                --binSize 10 \
+                --normalizeUsing RPKM \
+                --numberOfProcessors 4
+            echo "已创建: ${BW_DIR}/${variety}_IP_full.bw"   
+                 else
+            echo "警告: 未找到IP BAM文件: $ip_bam"
+        fi
+        
+        if [[ -f "$input_bam" ]]; then
+            # 生成input的bigWig
+            bamCoverage -b $input_bam \
+                -o ${BW_DIR}/${variety}_input_full.bw \
+                --binSize 10 \
+                --normalizeUsing RPKM \
+                --numberOfProcessors 4
+            echo "已创建: ${BW_DIR}/${variety}_input_full.bw"
+        else
+            echo "警告: 未找到input BAM文件: $input_bam"
+        fi
+    done
+
+echo "=== 开始peak calling ==="
+for bam_file in ${MERGED_DIR}/*merged.bam; do
+    sample=$(basename "$bam_file" _merged.bam)  
+    
+    # 检查是否已经运行过
+    if [ -f "${PEAKS_DIR}/${sample}_x800_bw2_full_nomodel.macs3_peaks.xls" ]; then  
+        echo "跳过已处理的样本：$sample"
+        continue
+    fi
+    
+    echo "处理样本：$sample"
+    macs3 callpeak -t "$bam_file" \
+    --extsize 200 -q 0.01 \
+    --nomodel --SPMR -f BAM \
+    -g 1e+9 -B \
+    -n "${PEAKS_DIR}/${sample}_x800_bw2_full_nomodel.macs3"
+done
+chmod +x merge_macs3_full.sh
+nohup ./merge_macs3_full.sh > merge_macs3_full.log 2>&1 &
