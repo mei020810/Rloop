@@ -1233,3 +1233,486 @@ for f in *.region_overlap_four.tsv
 do
     tail -n +2 "$f" >> all_species_region_overlap_four.tsv
 done
+column -t -s $'\t' region_overlap_four/all_species_region_overlap_four.tsv | less -S
+
+vim plot_region_overlap_four.R
+#!/usr/bin/env Rscript
+# 用法:
+# Rscript plot_region_overlap_four.R all_species_region_overlap_four.tsv region_plots
+#
+# 参数:
+#   1) 输入TSV
+#   2) 输出目录
+#
+# 默认:
+#   input  = "all_species_region_overlap_four.tsv"
+#   outdir = "region_plots"
+
+args <- commandArgs(trailingOnly = TRUE)
+input_file <- if (length(args) >= 1) args[1] else "all_species_region_overlap_four.tsv"
+outdir     <- if (length(args) >= 2) args[2] else "region_plots"
+
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+need_pkgs <- c("readr", "dplyr", "ggplot2", "stringr", "scales")
+for (pkg in need_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop(sprintf("缺少R包: %s\n请先安装: install.packages('%s')", pkg, pkg))
+  }
+}
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(scales)
+
+# 读表
+# ----------------------------
+df <- read_tsv(input_file, show_col_types = FALSE)
+
+required_cols <- c(
+  "species", "region", "bp_fraction", "region_density_bp_per_Mb"
+)
+
+missing_cols <- setdiff(required_cols, colnames(df))
+if (length(missing_cols) > 0) {
+  stop("缺少必要列: ", paste(missing_cols, collapse = ", "))
+}
+
+# 数值列转数值
+df <- df %>%
+  mutate(
+    bp_fraction = as.numeric(bp_fraction),
+    region_density_bp_per_Mb = as.numeric(region_density_bp_per_Mb)
+  )
+
+# 物种简称
+df <- df %>%
+  mutate(
+    species_short = species %>%
+      str_replace("_GCA_.*$", "") %>%
+      str_replace("_GCF_.*$", "") %>%
+      str_replace_all("_", " ")
+  )
+
+# 物种顺序：按输入表中第一次出现的顺序固定
+species_order <- df %>%
+  distinct(species, species_short) %>%
+  pull(species_short)
+
+# 也可以手动改成想要的顺序，比如：
+# species_order <- c(
+#   "Senna tora",
+#   "Arachis hypogaea",
+#   "Medicago truncatula",
+#   "Cicer arietinum",
+#   "Lotus japonicus",
+#   "Trifolium repens",
+#   "Glycine max"
+# )
+
+region_order <- c(
+  "promoter_only",
+  "promoter_gene_overlap",
+  "gene_only",
+  "intergenic_only"
+)
+
+region_labels <- c(
+  promoter_only = "Promoter only",
+  promoter_gene_overlap = "Promoter-gene overlap",
+  gene_only = "Gene only",
+  intergenic_only = "Intergenic only"
+)
+
+df <- df %>%
+  mutate(
+    species_short = factor(species_short, levels = species_order),
+    region = factor(region, levels = region_order)
+  )
+
+theme_set(
+  theme_bw(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+      plot.title = element_text(face = "bold"),
+      legend.title = element_text(face = "bold")
+    )
+)
+
+save_plot <- function(p, filename, width = 9, height = 6) {
+  ggsave(
+    filename = file.path(outdir, filename),
+    plot = p,
+    width = width,
+    height = height,
+    dpi = 300
+  )
+}
+
+# ----------------------------
+# 图1：bp_fraction 堆叠柱状图
+# ----------------------------
+p1 <- ggplot(df, aes(x = species_short, y = bp_fraction, fill = region)) +
+  geom_col(position = "stack", width = 0.8) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_discrete(labels = region_labels) +
+  labs(
+    title = "R-loop composition across four genomic region classes",
+    x = "Species",
+    y = "Fraction of total R-loop bp",
+    fill = "Region"
+  )
+
+save_plot(p1, "01_bp_fraction_stacked_bar.png", width = 10, height = 6)
+save_plot(p1, "01_bp_fraction_stacked_bar.pdf", width = 10, height = 6)
+
+# ----------------------------
+# 图2：region density 分组柱状图
+# ----------------------------
+p2 <- ggplot(df, aes(x = species_short, y = region_density_bp_per_Mb, fill = region)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  scale_fill_discrete(labels = region_labels) +
+  labs(
+    title = "R-loop density across four genomic region classes",
+    x = "Species",
+    y = "R-loop bp per Mb region",
+    fill = "Region"
+  )
+
+save_plot(p2, "02_region_density_grouped_bar.png", width = 11, height = 6)
+save_plot(p2, "02_region_density_grouped_bar.pdf", width = 11, height = 6)
+
+# ----------------------------
+# 可选：输出宽表，方便看
+# ----------------------------
+bp_wide <- df %>%
+  select(species, species_short, region, bp_fraction) %>%
+  tidyr::pivot_wider(names_from = region, values_from = bp_fraction)
+
+density_wide <- df %>%
+  select(species, species_short, region, region_density_bp_per_Mb) %>%
+  tidyr::pivot_wider(names_from = region, values_from = region_density_bp_per_Mb)
+
+write_tsv(bp_wide, file.path(outdir, "bp_fraction_wide.tsv"))
+write_tsv(density_wide, file.path(outdir, "region_density_wide.tsv"))
+
+cat("完成。\n")
+cat("输入文件: ", normalizePath(input_file), "\n", sep = "")
+cat("输出目录: ", normalizePath(outdir), "\n", sep = "")
+
+Rscript plot_region_overlap_four.R \
+  /data/mshe/deepRloopPro_data/region_overlap_four/all_species_region_overlap_four.tsv \
+  /data/mshe/deepRloopPro_data/region_overlap_four/plots
+
+#收集到了无注释物种的GBFF文件，先将其转换成gtf
+pip install biopython
+vim gbff_to_gtf.py
+#!/usr/bin/env python3
+import sys
+import gzip
+from collections import defaultdict
+from Bio import SeqIO
+from Bio.SeqFeature import CompoundLocation
+
+def open_maybe_gzip(path):
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt")
+    return open(path, "r")
+
+def gtf_escape(value):
+    if value is None:
+        return ""
+    return str(value).replace('"', '\\"')
+
+def format_attrs(attr_dict):
+    parts = []
+    for k, v in attr_dict.items():
+        parts.append(f'{k} "{gtf_escape(v)}";')
+    return " ".join(parts)
+
+def get_first(q, key, default=""):
+    vals = q.get(key, [])
+    return vals[0] if vals else default
+
+def feature_segments(feature):
+    """
+    Return 1-based closed intervals for a SeqFeature.
+    GTF uses 1-based inclusive coordinates.
+    """
+    loc = feature.location
+    if isinstance(loc, CompoundLocation):
+        parts = loc.parts
+    else:
+        parts = [loc]
+
+    segments = []
+    for p in parts:
+        start = int(p.start) + 1   # python/Biopython start is 0-based
+        end = int(p.end)           # end is already one past last base
+        if start <= end:
+            segments.append((start, end))
+    return segments
+
+def strand_symbol(feature):
+    s = feature.location.strand
+    if s == 1:
+        return "+"
+    elif s == -1:
+        return "-"
+    else:
+        return "."
+
+def main():
+    if len(sys.argv) != 3:
+        sys.stderr.write("Usage: python gbff_to_gtf.py <input.gbff[.gz]> <output.gtf>\n")
+        sys.exit(1)
+
+    infile = sys.argv[1]
+    outfile = sys.argv[2]
+
+    with open_maybe_gzip(infile) as handle, open(outfile, "w") as out:
+        out.write("# converted from GBFF by gbff_to_gtf.py\n")
+
+        for record in SeqIO.parse(handle, "genbank"):
+            seqname = record.id
+
+            # collect features by approximate transcript/gene grouping
+            # GenBank does not always have a clean gene->mRNA->exon hierarchy
+            gene_features = []
+            mrna_features = []
+            exon_features = []
+            cds_features = []
+
+            for f in record.features:
+                if f.type == "gene":
+                    gene_features.append(f)
+                elif f.type in ("mRNA", "transcript", "ncRNA", "tRNA", "rRNA"):
+                    mrna_features.append(f)
+                elif f.type == "exon":
+                    exon_features.append(f)
+                elif f.type == "CDS":
+                    cds_features.append(f)
+
+            # write gene features first
+            gene_index = 0
+            gene_ids_seen = set()
+
+            for gene in gene_features:
+                q = gene.qualifiers
+                gene_name = get_first(q, "gene", "")
+                locus_tag = get_first(q, "locus_tag", "")
+                gene_biotype = get_first(q, "gene_biotype", "gene")
+
+                gene_id = locus_tag or gene_name or f"gene_{seqname}_{gene_index+1}"
+                gene_index += 1
+                gene_ids_seen.add(gene_id)
+
+                attrs = {
+                    "gene_id": gene_id
+                }
+                if gene_name:
+                    attrs["gene_name"] = gene_name
+                if locus_tag and locus_tag != gene_id:
+                    attrs["locus_tag"] = locus_tag
+                if gene_biotype:
+                    attrs["gene_biotype"] = gene_biotype
+
+                for start, end in feature_segments(gene):
+                    out.write(
+                        "\t".join([
+                            seqname,
+                            "GBFF",
+                            "gene",
+                            str(start),
+                            str(end),
+                            ".",
+                            strand_symbol(gene),
+                            ".",
+                            format_attrs(attrs)
+                        ]) + "\n"
+                    )
+
+            # helper to assign transcript/gene ids from qualifiers
+            tx_counter = 0
+            cds_counter = 0
+
+            # write transcript-like features
+            for tx in mrna_features:
+                q = tx.qualifiers
+                gene_name = get_first(q, "gene", "")
+                locus_tag = get_first(q, "locus_tag", "")
+                transcript_id = (
+                    get_first(q, "transcript_id", "")
+                    or get_first(q, "product", "")
+                    or get_first(q, "standard_name", "")
+                )
+
+                gene_id = locus_tag or gene_name or f"gene_{seqname}_unknown"
+                if transcript_id == "":
+                    tx_counter += 1
+                    transcript_id = f"{gene_id}.tx{tx_counter}"
+
+                attrs = {
+                    "gene_id": gene_id,
+                    "transcript_id": transcript_id
+                }
+                if gene_name:
+                    attrs["gene_name"] = gene_name
+                product = get_first(q, "product", "")
+                if product:
+                    attrs["product"] = product
+
+                for start, end in feature_segments(tx):
+                    out.write(
+                        "\t".join([
+                            seqname,
+                            "GBFF",
+                            "transcript",
+                            str(start),
+                            str(end),
+                            ".",
+                            strand_symbol(tx),
+                            ".",
+                            format_attrs(attrs)
+                        ]) + "\n"
+                    )
+
+                # if transcript is split, also emit exons from its parts
+                segments = feature_segments(tx)
+                if len(segments) == 1:
+                    exon_iter = segments
+                else:
+                    exon_iter = segments
+                exon_number = 0
+                for start, end in exon_iter:
+                    exon_number += 1
+                    exon_attrs = dict(attrs)
+                    exon_attrs["exon_number"] = exon_number
+                    out.write(
+                        "\t".join([
+                            seqname,
+                            "GBFF",
+                            "exon",
+                            str(start),
+                            str(end),
+                            ".",
+                            strand_symbol(tx),
+                            ".",
+                            format_attrs(exon_attrs)
+                        ]) + "\n"
+                    )
+
+            # explicit exon features
+            for ex in exon_features:
+                q = ex.qualifiers
+                gene_name = get_first(q, "gene", "")
+                locus_tag = get_first(q, "locus_tag", "")
+                gene_id = locus_tag or gene_name or f"gene_{seqname}_unknown"
+                transcript_id = (
+                    get_first(q, "transcript_id", "")
+                    or get_first(q, "product", "")
+                    or f"{gene_id}.exon_parent"
+                )
+
+                attrs = {
+                    "gene_id": gene_id,
+                    "transcript_id": transcript_id
+                }
+                if gene_name:
+                    attrs["gene_name"] = gene_name
+
+                exon_num = 0
+                for start, end in feature_segments(ex):
+                    exon_num += 1
+                    exon_attrs = dict(attrs)
+                    exon_attrs["exon_number"] = exon_num
+                    out.write(
+                        "\t".join([
+                            seqname,
+                            "GBFF",
+                            "exon",
+                            str(start),
+                            str(end),
+                            ".",
+                            strand_symbol(ex),
+                            ".",
+                            format_attrs(exon_attrs)
+                        ]) + "\n"
+                    )
+
+            # CDS features
+            for cds in cds_features:
+                q = cds.qualifiers
+                gene_name = get_first(q, "gene", "")
+                locus_tag = get_first(q, "locus_tag", "")
+                protein_id = get_first(q, "protein_id", "")
+                product = get_first(q, "product", "")
+
+                gene_id = locus_tag or gene_name or f"gene_{seqname}_unknown"
+                transcript_id = (
+                    get_first(q, "transcript_id", "")
+                    or protein_id
+                    or f"{gene_id}.cds"
+                )
+
+                phase = get_first(q, "codon_start", "")
+                # GTF phase is 0/1/2, codon_start is usually 1/2/3
+                if phase in ("1", "2", "3"):
+                    phase = str(int(phase) - 1)
+                else:
+                    phase = "."
+
+                attrs = {
+                    "gene_id": gene_id,
+                    "transcript_id": transcript_id
+                }
+                if gene_name:
+                    attrs["gene_name"] = gene_name
+                if protein_id:
+                    attrs["protein_id"] = protein_id
+                if product:
+                    attrs["product"] = product
+
+                for start, end in feature_segments(cds):
+                    out.write(
+                        "\t".join([
+                            seqname,
+                            "GBFF",
+                            "CDS",
+                            str(start),
+                            str(end),
+                            ".",
+                            strand_symbol(cds),
+                            phase,
+                            format_attrs(attrs)
+                        ]) + "\n"
+                    )
+
+if __name__ == "__main__":
+    main()
+
+#解压并转换
+mkdir -p GTF_from_GBFF
+for f in GBFF/*.GBFF.zip
+do
+    sp=$(basename "$f" .GBFF.zip)
+    workdir="GBFF/$sp"
+    echo "[INFO] processing $sp"
+
+    mkdir -p "$workdir"
+    unzip -oq "$f" -d "$workdir"
+    gbff=$(find "$workdir" -type f \( -name "genomic.gbff" -o -name "genomic.gbff.gz" \) | head -n 1)
+
+    if [[ -z "$gbff" ]]; then
+        echo "[WARN] genomic.gbff not found in $f"
+        continue
+    fi
+
+    python gbff_to_gtf.py "$gbff" "GTF_from_GBFF/${sp}.from_gbff.gtf" \
+      || echo "[ERROR] failed: $sp"
+done
+###所有的GBFF文件都没有gene、mRNA、CDS位点标识，不可用###
+
