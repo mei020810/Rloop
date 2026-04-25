@@ -405,6 +405,7 @@ Ceratonia_siliqua_GCA_055554145.1	/data/mshe/deepRloopPro_data/genome_file/Cerat
 Sindora_glabra_GCA_020226215.1	/data/mshe/deepRloopPro_data/genome_file/Sindora_glabra_GCA_020226215.1/ncbi_dataset/data/GCA_020226215.1/GCA_020226215.1_CAF_Sgla_1.0_genomic.fna	/data/mshe/deepRloopPro_data/chromsize_primary/Sindora_glabra_GCA_020226215.1.chromsize
 EOF
 wc -l /data/mshe/deepRloopPro_data/run_list_A.tsv
+nohup /data/mshe/deepRloopPro_data/run_deepRloop_A.sh > /data/mshe/deepRloopPro_data/run_deepRloop_A.master.log 2>&1 &
 #重新生成表格
 cd /data/mshe/deepRloopPro_data
 OUT="rloop_summary_changed.tsv"
