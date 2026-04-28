@@ -523,7 +523,7 @@ column -t -s $'\t' rloop_summary_changed_with_branch_sorted.tsv | less -S
 vim rloop_summary_with_branch_plot.R
 #!/usr/bin/env Rscript
 # 用法:
-# Rscript plot_rloop.R rloop_summary_changed_with_branch_sorted.tsv summary_plots
+# Rscript rloop_summary_with_branch_plot.R rloop_summary_changed_with_branch_sorted.tsv summary_plots
 #
 # 第1个参数: 输入TSV
 # 第2个参数: 输出目录
