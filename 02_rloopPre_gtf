@@ -953,6 +953,226 @@ FNR==1 {
 echo "已生成: $OUT"
 column -t -s $'\t' all_species_region_overlap_four_with_branch.tsv | less -S
 #生成带分支信息的图
+vim plot_region_overlap_four.R
+#!/usr/bin/env Rscript
+# 用法:
+# Rscript plot_region_overlap_four.R all_species_region_overlap_four.tsv region_plots
+#
+# 参数:
+#   1) 输入TSV
+#   2) 输出目录
+#
+# 默认:
+#   input  = "all_species_region_overlap_four.tsv"
+#   outdir = "region_plots"
+
+args <- commandArgs(trailingOnly = TRUE)
+input_file <- if (length(args) >= 1) args[1] else "all_species_region_overlap_four.tsv"
+outdir     <- if (length(args) >= 2) args[2] else "region_plots"
+
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+need_pkgs <- c("readr", "dplyr", "ggplot2", "stringr", "scales","tidyr")
+for (pkg in need_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop(sprintf("缺少R包: %s\n请先安装: install.packages('%s')", pkg, pkg))
+  }
+}
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(scales)
+
+# 读表
+# ----------------------------
+df <- read_tsv(input_file, show_col_types = FALSE)
+
+required_cols <- c(
+  "species","亚科","主要分支", "region", "bp_fraction", "region_density_bp_per_Mb"
+)
+
+missing_cols <- setdiff(required_cols, colnames(df))
+if (length(missing_cols) > 0) {
+  stop("缺少必要列: ", paste(missing_cols, collapse = ", "))
+}
+
+# 数值列转数值
+df <- df %>%
+  mutate(
+    bp_fraction = as.numeric(bp_fraction),
+    region_density_bp_per_Mb = as.numeric(region_density_bp_per_Mb)
+  )
+
+# 分支顺序
+branch_order <- c(
+  "Cercidoideae | basal_non_papilionoid",
+  "Detarioideae | basal_non_papilionoid",
+  "Dialioideae | basal_non_papilionoid",
+  "Caesalpinioideae | Cassieae",
+  "Caesalpinioideae | Mimoseae",
+  "Papilionoideae | dalbergioid",
+  "Papilionoideae | genistoid",
+  "Papilionoideae | IRLC",
+  "Papilionoideae | millettioid_phaseoloid"
+)
+
+# 物种简称 + 分支分组
+df <- df %>%
+  mutate(
+    species_short = species %>%
+      str_replace("_GCA_.*$", "") %>%
+      str_replace("_GCF_.*$", "") %>%
+      str_replace("_LIS$", "") %>%
+      str_replace_all("_", " "),
+    branch_group = paste(亚科, 主要分支, sep = " | "),
+    branch_group = factor(branch_group, levels = branch_order)
+  )
+
+# 检查是否有分支没有纳入 branch_order
+unknown_branch <- df %>%
+  filter(is.na(branch_group)) %>%
+  distinct(亚科, 主要分支)
+
+if (nrow(unknown_branch) > 0) {
+  warning(
+    "有分支没有出现在 branch_order 中：\n",
+    paste(apply(unknown_branch, 1, paste, collapse = " | "), collapse = "\n")
+  )
+}
+
+# 物种顺序：先按分支，再按物种名
+species_order <- df %>%
+  distinct(species, species_short, branch_group) %>%
+  arrange(branch_group, species_short) %>%
+  pull(species_short)
+
+# 也可以手动改成想要的顺序，比如：
+# species_order <- c(
+#   "Senna tora",
+#   "Arachis hypogaea",
+#   "Medicago truncatula",
+#   "Cicer arietinum",
+#   "Lotus japonicus",
+#   "Trifolium repens",
+#   "Glycine max"
+# )
+
+region_order <- c(
+  "promoter_only",
+  "promoter_gene_overlap",
+  "gene_only",
+  "intergenic_only"
+)
+
+region_labels <- c(
+  promoter_only = "Promoter only",
+  promoter_gene_overlap = "Promoter-gene overlap",
+  gene_only = "Gene only",
+  intergenic_only = "Intergenic only"
+)
+
+df <- df %>%
+  mutate(
+    species_short = factor(species_short, levels = species_order),
+    region = factor(region, levels = region_order)
+  )
+
+theme_set(
+  theme_bw(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+      plot.title = element_text(face = "bold"),
+      legend.title = element_text(face = "bold")
+    )
+)
+
+save_plot <- function(p, filename, width = 9, height = 6) {
+  filepath <- file.path(outdir, filename)
+
+  if (grepl("\\.pdf$", filename, ignore.case = TRUE)) {
+    ggsave(
+      filename = filepath,
+      plot = p,
+      width = width,
+      height = height,
+      device = grDevices::cairo_pdf
+    )
+  } else {
+    ggsave(
+      filename = filepath,
+      plot = p,
+      width = width,
+      height = height,
+      dpi = 300
+    )
+  }
+}
+
+# ----------------------------
+# 图1：bp_fraction 堆叠柱状图
+# ----------------------------
+p1 <- ggplot(df, aes(x = species_short, y = bp_fraction, fill = region)) +
+  geom_col(position = "stack", width = 0.8) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_discrete(labels = region_labels) +
+  facet_grid(. ~ branch_group, scales = "free_x", space = "free_x") +
+  labs(
+    title = "R-loop composition across four genomic region classes",
+    x = "Species",
+    y = "Fraction of total R-loop bp",
+    fill = "Region"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    strip.text.x = element_text(size = 8),
+    panel.spacing.x = unit(0.4, "lines"),
+    plot.margin = margin(t = 10, r = 10, b = 35, l = 35)
+  )
+
+save_plot(p1, "01_bp_fraction_stacked_bar.png", width = 10, height = 6)
+save_plot(p1, "01_bp_fraction_stacked_bar.pdf", width = 10, height = 6)
+
+# ----------------------------
+# 图2：region density 分组柱状图
+# ----------------------------
+p2 <- ggplot(df, aes(x = species_short, y = region_density_bp_per_Mb, fill = region)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  scale_fill_discrete(labels = region_labels) +
+  facet_grid(. ~ branch_group, scales = "free_x", space = "free_x") +
+  labs(
+    title = "R-loop density across four genomic region classes",
+    x = "Species",
+    y = "R-loop bp per Mb region",
+    fill = "Region"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    strip.text.x = element_text(size = 8),
+    panel.spacing.x = unit(0.4, "lines"),
+    plot.margin = margin(t = 10, r = 10, b = 35, l = 35)
+  )
+
+# ----------------------------
+# 可选：输出宽表，方便看
+# ----------------------------
+bp_wide <- df %>%
+  select(species, species_short, 亚科, 主要分支, branch_group, region, bp_fraction) %>%
+  tidyr::pivot_wider(names_from = region, values_from = bp_fraction)
+
+density_wide <- df %>%
+  select(species, species_short, 亚科, 主要分支, branch_group, region, region_density_bp_per_Mb) %>%
+  tidyr::pivot_wider(names_from = region, values_from = region_density_bp_per_Mb)
+
+write_tsv(bp_wide, file.path(outdir, "bp_fraction_wide.tsv"))
+write_tsv(density_wide, file.path(outdir, "region_density_wide.tsv"))
+
+cat("完成。\n")
+cat("输入文件: ", normalizePath(input_file), "\n", sep = "")
+cat("输出目录: ", normalizePath(outdir), "\n", sep = "")
+
 Rscript plot_region_overlap_four.R \
   /data/mshe/deepRloopPro_data/region_overlap_four/all_species_region_overlap_four_with_branch.tsv \
   /data/mshe/deepRloopPro_data/region_overlap_four/plots
