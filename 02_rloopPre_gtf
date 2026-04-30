@@ -1,5 +1,958 @@
+cd /data/mshe/deepRloopPro_data/GTF_find
 unzip Bauhinia_variegata_GCA_022379115.2.zip -d Bauhinia_variegata_GCA_022379115.2
 unzip Crotalaria_pallida_GCA_037953625.1.zip -d Crotalaria_pallida_GCA_037953625.1
-unzip Lupinus_luteus_GCA_964019355.1.zip -d Lupinus_luteus_GCA_964019355.1
 unzip Phaseolus_vulgaris_GCF_000499845.2.zip -d Phaseolus_vulgaris_GCF_000499845.2
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
+unzip Cajanus_cajan_GCF_000340665.2.zip -d Cajanus_cajan_GCF_000340665.2
+unzip Vigna_radiata_GCA_000741045.2.gtf.zip -d Vigna_radiata_GCA_000741045.2
+unzip Vicia_faba_GCA_948472305.1.zip -d Vicia_faba_GCA_948472305.1
+unzip Lupinus_angustifolius_GCA_001865875.1.zip -d Lupinus_angustifolius_GCA_001865875.1
+unzip Lathyrus_oleraceus_GCA_964186695.1.zip -d Lathyrus_oleraceus_GCA_964186695.1
+
+mv Vicia_faba_GCA_948472305.1_genomic.fna Vicia_faba_GCA_948472305.1_genomic.gtf Vigna_radiata_GCF_000741045.2_genomic.fna Vigna_radiata_GCF_000741045.2_genomic.gtf Phaseolus_vulgaris_GCA_000499845.2_genomic.fna Phaseolus_vulgaris_GCA_000499845.2_genomic.gtf Lablab_purpureus_LIS_genomic.fna Lablab_purpureus_LIS_genomic.gff3 Crotalaria_pallida_GCA_037953625.1_genomic.fna Crotalaria_pallida_GCA_037953625.1_genomic.gtf Chamaecrista_fasciculata_LIS_genomic.fna Chamaecrista_fasciculata_LIS_genomic.gff3 Cajanus_cajan_GCF_000340665.2_genomic.fna Cajanus_cajan_GCF_000340665.2_genomic.gtf Bauhinia_variegata_GCA_022379115.2_genomic.fna Bauhinia_variegata_GCA_022379115.2_genomic.gtf genome_file/
+mv Lupinus_angustifolius_GCA_001865875.1_genomic.fna Lupinus_angustifolius_GCA_001865875.1_genomic.gtf genome_file/
+cp Lathyrus_oleraceus_GCA_964186695.1/ncbi_dataset/data/GCA_964186695.1/genomic.gtf genome_file/Lathyrus_oleraceus_GCA_964186695.1_genomic.gtf
+cp Lathyrus_oleraceus_GCA_964186695.1/ncbi_dataset/data/GCA_964186695.1/GCA_964186695.1_JIC_Psat_v1.3_genomic.fna genome_file/Lathyrus_oleraceus_GCA_964186695.1_genomic.fna
+#建索引
+for fa in genome_file/*_genomic.fna
+do
+    echo "[INFO] indexing $fa"
+    samtools faidx "$fa"
+done
+samtools faidx "genome_file/Lupinus_angustifolius_GCA_001865875.1_genomic.fna"
+samtools faidx Lathyrus_oleraceus_GCA_964186695.1_genomic.fna
+#查看各染色体前缀
+for fai in genome_file/*_genomic.fna.fai
+do
+    echo "=============================="
+    echo "$fai"
+    cut -f1,2 "$fai" | head -n 30
+done
+cut -f1,2 "genome_file/Lupinus_angustifolius_GCA_001865875.1_genomic.fna.fai" | head -n 30
+
+vim make_chromsize_primary.sh
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=/data/mshe/deepRloopPro_data/GTF_find/genome_file
+OUT=/data/mshe/deepRloopPro_data/GTF_find/chromsize_primary
+mkdir -p "$OUT"
+make_chromsize() {
+    local species="$1"
+    local fasta="$2"
+    local mode="$3"
+    local out="$OUT/${species}.chromsize"
+
+    echo "=================================================="
+    echo "[INFO] species: $species"
+    echo "[INFO] fasta:   $fasta"
+    echo "[INFO] mode:    $mode"
+
+    if [[ ! -f "$fasta" ]]; then
+        echo "[ERROR] missing fasta: $fasta" >&2
+        return 1
+    fi
+
+    local fai="${fasta}.fai"
+
+    case "$mode" in
+        CM)
+            awk 'BEGIN{OFS="\t"} $1 ~ /^CM/ {print $1,$2}' "$fai" > "$out"
+            ;;
+        NC_main)
+            # NCBI RefSeq 主染色体常是 NC_，但叶绿体/线粒体也可能是 NC_ , 加长度过滤可去掉 organelle 和很小的非主序列
+            awk 'BEGIN{OFS="\t"} $1 ~ /^NC_/ && $2 > 1000000 {print $1,$2}' "$fai" > "$out"
+            ;;
+        OX_main)
+            awk 'BEGIN{OFS="\t"} $1 ~ /^OX/ && $2 > 1000000 {print $1,$2}' "$fai" > "$out"
+            ;;
+        Chamaecrista_LIS)
+            awk 'BEGIN{OFS="\t"} $1 ~ /\.Chr[0-9][0-9]$/ {print $1,$2}' "$fai" > "$out"
+            ;;
+        Lablab_LIS)
+            awk 'BEGIN{OFS="\t"} $1 ~ /\.chr[0-9][0-9]$/ {print $1,$2}' "$fai" > "$out"
+            ;;
+        *)
+            echo "[ERROR] unknown mode: $mode" >&2
+            return 1
+            ;;
+    esac
+
+    echo "[OK] wrote: $out"
+    echo "[INFO] retained sequences: $(wc -l < "$out")"
+    cat "$out"
+}
+
+# 1. Bauhinia: CM 主染色体
+make_chromsize \
+  "Bauhinia_variegata_GCA_022379115.2" \
+  "$ROOT/Bauhinia_variegata_GCA_022379115.2_genomic.fna" \
+  "CM"
+
+# 2. Cajanus: NC_ 主染色体
+make_chromsize \
+  "Cajanus_cajan_GCF_000340665.2" \
+  "$ROOT/Cajanus_cajan_GCF_000340665.2_genomic.fna" \
+  "NC_main"
+
+# 3. Chamaecrista: LIS Chr01-Chr08
+make_chromsize \
+  "Chamaecrista_fasciculata_LIS" \
+  "$ROOT/Chamaecrista_fasciculata_LIS_genomic.fna" \
+  "Chamaecrista_LIS"
+
+# 4. Crotalaria: CM 主染色体
+make_chromsize \
+  "Crotalaria_pallida_GCA_037953625.1" \
+  "$ROOT/Crotalaria_pallida_GCA_037953625.1_genomic.fna" \
+  "CM"
+
+# 5. Lablab: LIS chr01-chr11
+make_chromsize \
+  "Lablab_purpureus_LIS" \
+  "$ROOT/Lablab_purpureus_LIS_genomic.fna" \
+  "Lablab_LIS"
+
+# 6. Lupinus angustifolius: CM 主染色体
+make_chromsize \
+  "Lupinus_angustifolius_GCA_001865875.1" \
+  "$ROOT/Lupinus_angustifolius_GCA_001865875.1_genomic.fna" \
+  "CM"
+
+# 7. Phaseolus: CM 主染色体
+make_chromsize \
+  "Phaseolus_vulgaris_GCA_000499845.2" \
+  "$ROOT/Phaseolus_vulgaris_GCA_000499845.2_genomic.fna" \
+  "CM"
+
+# 8. Vicia: OX 主染色体
+make_chromsize \
+  "Vicia_faba_GCA_948472305.1" \
+  "$ROOT/Vicia_faba_GCA_948472305.1_genomic.fna" \
+  "OX_main"
+
+# 9. Vigna: NC_ 主染色体
+make_chromsize \
+  "Vigna_radiata_GCF_000741045.2" \
+  "$ROOT/Vigna_radiata_GCF_000741045.2_genomic.fna" \
+  "NC_main"
+
+echo "=================================================="
+echo "[ALL DONE] chromsize files written to: $OUT"
+
+echo
+echo "[SUMMARY]"
+for f in "$OUT"/*.chromsize
+do
+    echo -e "$(basename "$f")\t$(wc -l < "$f")"
+done | sort
+
+chmod +x make_chromsize_primary.sh
+bash make_chromsize_primary.sh
+
+OUT=/data/mshe/deepRloopPro_data/GTF_find/chromsize_primary
+fasta="Lathyrus_oleraceus_GCA_964186695.1_genomic.fna"
+fai="${fasta}.fai"
+out="${OUT}/Lathyrus_oleraceus_GCA_964186695.1.chromsize"
+awk 'BEGIN{OFS="\t"} $1 ~ /^OZ/ && $2 > 1000000 {print $1,$2}' "$fai" > "$out"
+
+cat > /data/mshe/deepRloopPro_data/new_list_A.tsv <<'EOF'
+Bauhinia_variegata_GCA_022379115.2      /data/mshe/deepRloopPro_data/GTF_find/genome_file/Bauhinia_variegata_GCA_022379115.2_genomic.fna     /data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Bauhinia_variegata_GCA_022379115.2.chromsize
+Zenia_insignis_GCA_052059195.1  /data/mshe/deepRloopPro_data/genome_file/Zenia_insignis_GCA_052059195.1/ncbi_dataset/data/GCA_052059195.1/GCA_052059195.1_KIB_Zeins_1.0_genomic.fna  /data/mshe/deepRloopPro_data/chromsize_primary/Zenia_insignis_GCA_052059195.1.chromsize
+Acacia_melanoxylon_GCA_048487655.1      /data/mshe/deepRloopPro_data/genome_file/Acacia_melanoxylon_GCA_048487655.1/ncbi_dataset/data/GCA_048487655.1/GCA_048487655.1_ASM4848765v1_genomic.fna       /data/mshe/deepRloopPro_data/chromsize_primary/Acacia_melanoxylon_GCA_048487655.1.chromsize
+Senna_tora_GCA_014851425.1      /data/mshe/deepRloopPro_data/genome_file/Senna_tora_GCA_014851425.1/ncbi_dataset/data/GCA_014851425.1/GCA_014851425.1_ASM1485142v1_genomic.fna       /data/mshe/deepRloopPro_data/chromsize_primary/Senna_tora_GCA_014851425.1.chromsize
+Crotalaria_pallida_GCA_037953625.1      /data/mshe/deepRloopPro_data/GTF_find/genome_file/Crotalaria_pallida_GCA_037953625.1_genomic.fna     /data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Crotalaria_pallida_GCA_037953625.1.chromsize
+Lupinus_angustifolius_GCA_001865875.1   /data/mshe/deepRloopPro_data/GTF_find/genome_file/Lupinus_angustifolius_GCA_001865875.1_genomic.fna  /data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Lupinus_angustifolius_GCA_001865875.1.chromsize
+Dalbergia_cochinchinensis_GCA_031216125.1       /data/mshe/deepRloopPro_data/genome_file/Dalbergia_cochinchinensis_GCA_031216125.1/ncbi_dataset/data/GCA_031216125.1/GCA_031216125.1_Dcoc_1.0_genomic.fna    /data/mshe/deepRloopPro_data/chromsize_primary/Dalbergia_cochinchinensis_GCA_031216125.1.chromsize
+Medicago_truncatula_GCA_003473485.2     /data/mshe/deepRloopPro_data/genome_file/Medicago_truncatula_GCA_003473485.2/ncbi_dataset/data/GCF_003473485.1/GCF_003473485.1_MtrunA17r5.0-ANR_genomic.fna  /data/mshe/deepRloopPro_data/chromsize_primary/Medicago_truncatula_GCA_003473485.2.chromsize
+Cicer_arietinum_GCA_000331145.2 /data/mshe/deepRloopPro_data/genome_file/Cicer_arietinum_GCA_000331145.2/ncbi_dataset/data/GCF_000331145.2/GCF_000331145.2_Cicar.CDCFrontier_v2.0_genomic.fna        /data/mshe/deepRloopPro_data/chromsize_primary/Cicer_arietinum_GCA_000331145.2.chromsize
+Arachis_hypogaea_GCA_039854485.1        /data/mshe/deepRloopPro_data/genome_file/Arachis_hypogaea_GCA_039854485.1/ncbi_dataset/data/GCA_039854485.1/GCA_039854485.1_S83_genomic.fna  /data/mshe/deepRloopPro_data/chromsize_primary/Arachis_hypogaea_GCA_039854485.1.chromsize
+Vicia_faba_GCA_948472305.1      /data/mshe/deepRloopPro_data/GTF_find/genome_file/Vicia_faba_GCA_948472305.1_genomic.fna    /data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Vicia_faba_GCA_948472305.1.chromsize
+Lathyrus_oleraceus_GCA_964186695.1      /data/mshe/deepRloopPro_data/GTF_find/genome_file/Lathyrus_oleraceus_GCA_964186695.1_genomic.fna     /data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Lathyrus_oleraceus_GCA_964186695.1.chromsize
+Trifolium_repens_GCA_030408175.1        /data/mshe/deepRloopPro_data/genome_file/Trifolium_repens_GCA_030408175.1/ncbi_dataset/data/GCA_030408175.1/GCA_030408175.1_UTM_Trep_v1.0_genomic.fna        /data/mshe/deepRloopPro_data/chromsize_primary/Trifolium_repens_GCA_030408175.1.chromsize
+Glycine_max_GCA_000004515.5     /data/mshe/deepRloopPro_data/genome_file/Glycine_max_GCA_000004515.5/ncbi_dataset/data/GCF_000004515.6/GCF_000004515.6_Glycine_max_v4.0_genomic.fna  /data/mshe/deepRloopPro_data/chromsize_primary/Glycine_max_GCA_000004515.5.chromsize
+Phaseolus_vulgaris_GCA_000499845.2      /data/mshe/deepRloopPro_data/GTF_find/genome_file/Phaseolus_vulgaris_GCA_000499845.2_genomic.fna     /data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Phaseolus_vulgaris_GCA_000499845.2.chromsize
+Vigna_radiata_GCF_000741045.2   /data/mshe/deepRloopPro_data/GTF_find/genome_file/Vigna_radiata_GCF_000741045.2_genomic.fna /data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Vigna_radiata_GCF_000741045.2.chromsize
+Cajanus_cajan_GCF_000340665.2   /data/mshe/deepRloopPro_data/GTF_find/genome_file/Cajanus_cajan_GCF_000340665.2_genomic.fna /data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Cajanus_cajan_GCF_000340665.2.chromsize
+Lablab_purpureus_LIS    /data/mshe/deepRloopPro_data/GTF_find/genome_file/Lablab_purpureus_LIS_genomic.fna      /data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Lablab_purpureus_LIS.chromsize
+Chamaecrista_fasciculata_LIS    /data/mshe/deepRloopPro_data/GTF_find/genome_file/Chamaecrista_fasciculata_LIS_genomic.fna  /data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Chamaecrista_fasciculata_LIS.chromsize
+Sindora_glabra_GCA_020226215.1  /data/mshe/deepRloopPro_data/genome_file/Sindora_glabra_GCA_020226215.1/ncbi_dataset/data/GCA_020226215.1/GCA_020226215.1_CAF_Sgla_1.0_genomic.fna   /data/mshe/deepRloopPro_data/chromsize_primary/Sindora_glabra_GCA_020226215.1.chromsize
+wc -l /data/mshe/deepRloopPro_data/new_list_A.tsv
+
+vim run_deepRloop_A.sh  ##此处改了RUNLIST=/data/mshe/deepRloopPro_data/run_list_A.tsv改成RUNLIST=/data/mshe/deepRloopPro_data/new_list_A.tsv
+#!/usr/bin/env bash
+set -euo pipefail
+MODEL=/home/mshe/deepRloop_models/transfer_scale128_single_13_0.29202.hdf5
+RUNLIST=/data/mshe/deepRloopPro_data/new_list_A.tsv
+OUTDIR=/data/mshe/deepRloopPro_data/deepRloop_results_A
+LOGDIR=/data/mshe/deepRloopPro_data/deepRloop_logs_A
+MAXJOBS=8
+mkdir -p "$OUTDIR" "$LOGDIR"
+while IFS=$'\t' read -r PREFIX FASTA CHROMSIZE
+do
+    FINALBED="${OUTDIR}/${PREFIX}_final_predict.bed"
+    LOGFILE="${LOGDIR}/${PREFIX}.log"
+
+    # 已经跑完：跳过
+    if [ -s "$FINALBED" ]; then
+        echo "[SKIP DONE] $PREFIX"
+        continue
+    fi
+
+    # 已经在跑：跳过
+    if pgrep -af "deepRloopPredict.py.*${PREFIX}" >/dev/null 2>&1; then
+        echo "[SKIP RUNNING] $PREFIX"
+        continue
+    fi
+
+    while [ "$(jobs -r | wc -l)" -ge "$MAXJOBS" ]; do
+        sleep 30
+    done
+
+    (
+        cd "$OUTDIR"
+        echo "[START] $(date '+%F %T') $PREFIX"
+        deepRloopPredict.py \
+          --h5 "$MODEL" \
+          --fasta "$FASTA" \
+          --chromsize "$CHROMSIZE" \
+          --prefix "$PREFIX" \
+          > "$LOGFILE" 2>&1
+        echo "[DONE] $(date '+%F %T') $PREFIX"
+    ) &
+done < "$RUNLIST"
+wait
+echo "[ALL DONE] $(date '+%F %T')"
+
+#分支映射表
+cat > species_branch_map_20.tsv <<'EOF'
+物种    亚科    主要分支
+Bauhinia_variegata_GCA_022379115.2      Cercidoideae    basal_non_papilionoid
+Zenia_insignis_GCA_052059195.1  Dialioideae     basal_non_papilionoid
+Sindora_glabra_GCA_020226215.1  Detarioideae    basal_non_papilionoid
+Acacia_melanoxylon_GCA_048487655.1      Caesalpinioideae        Mimoseae
+Senna_tora_GCA_014851425.1      Caesalpinioideae        Cassieae
+Chamaecrista_fasciculata_LIS    Caesalpinioideae        Cassieae
+Crotalaria_pallida_GCA_037953625.1      Papilionoideae  genistoid
+Lupinus_angustifolius_GCA_001865875.1   Papilionoideae  genistoid
+Arachis_hypogaea_GCA_039854485.1        Papilionoideae  dalbergioid
+Dalbergia_cochinchinensis_GCA_031216125.1       Papilionoideae  dalbergioid
+Medicago_truncatula_GCA_003473485.2     Papilionoideae  IRLC
+Cicer_arietinum_GCA_000331145.2 Papilionoideae  IRLC
+Vicia_faba_GCA_948472305.1      Papilionoideae  IRLC
+Lathyrus_oleraceus_GCA_964186695.1      Papilionoideae  IRLC
+Trifolium_repens_GCA_030408175.1        Papilionoideae  IRLC
+Glycine_max_GCA_000004515.5     Papilionoideae  millettioid_phaseoloid
+Phaseolus_vulgaris_GCA_000499845.2      Papilionoideae  millettioid_phaseoloid
+Vigna_radiata_GCF_000741045.2   Papilionoideae  millettioid_phaseoloid
+Cajanus_cajan_GCF_000340665.2   Papilionoideae  millettioid_phaseoloid
+Lablab_purpureus_LIS    Papilionoideae  millettioid_phaseoloid
+EOF
+wc -l species_branch_map_20.tsv
+
+#重新生成summary表
+RUNLIST="/data/mshe/deepRloopPro_data/new_list_A.tsv"
+OUT="rloop_summary_new.tsv"
+printf "物种\t染色体数\t主染色体总长度\tRloop区域数\t总覆盖长度\t平均区域长度\t每100Mb区域数\tRloop覆盖比例\t平均每条染色体区域数\t每条染色体区域数\n" > "$OUT"
+# 从 run_list_A.tsv 读取 prefix -> chromsize 路径
+declare -A CHRMAP
+
+while IFS=$'\t' read -r PREFIX FASTA CHROMSIZE
+do
+    CHRMAP["$PREFIX"]="$CHROMSIZE"
+done < "$RUNLIST"
+
+for bed in $(ls deepRloop_results_A/*_final_predict.bed | sort)
+do
+    [ -e "$bed" ] || continue
+
+    prefix=$(basename "$bed" _final_predict.bed)
+
+    chromsize="${CHRMAP[$prefix]:-}"
+
+    if [ -z "$chromsize" ]; then
+        echo "[WARN] $prefix 不在 run_list_A.tsv 里，chromsize 设为 NA" >&2
+    elif [ ! -f "$chromsize" ]; then
+        echo "[WARN] $prefix 的 chromsize 文件不存在: $chromsize" >&2
+    fi
+
+    # 染色体数 和 主染色体总长度
+    if [ -n "$chromsize" ] && [ -f "$chromsize" ]; then
+        chr_n=$(wc -l < "$chromsize")
+        chr_total_len=$(awk '{sum += $2} END{print sum+0}' "$chromsize")
+    else
+        chr_n="NA"
+        chr_total_len="NA"
+    fi
+
+column -t -s $'\t' "$OUT" | less -Stal_len" "$region_n" "$total_len" "$mean_len" "$per100mb" "$coverage_ratio" "$per_chr" "$c
+#将分支映射到表格上
+awk -F'\t' '
+NR==FNR {
+    if (FNR > 1) map[$1] = $2 FS $3
+    next
+}
+FNR==1 {
+    print $1 FS "亚科" FS "主要分支" FS $2 FS $3 FS $4 FS $5 FS $6 FS $7 FS $8 FS $9 FS $10
+    next
+}
+{
+    if ($1 in map) {
+        print $1 FS map[$1] FS $2 FS $3 FS $4 FS $5 FS $6 FS $7 FS $8 FS $9 FS $10
+    } else {
+        print $1 FS "NA" FS "NA" FS $2 FS $3 FS $4 FS $5 FS $6 FS $7 FS $8 FS $9 FS $10
+    }
+}
+' species_branch_map_20.tsv rloop_summary_new.tsv | {
+    IFS= read -r header
+    printf '%s\n' "$header"
+    sort -t $'\t' -k2,2 -k3,3 -k1,1
+} > rloop_summary_new_with_branch_sorted.tsv
+column -t -s $'\t' rloop_summary_new_with_branch_sorted.tsv | less -S
+
+# 删多的分支，修复分支标签截断问题
+vim rloop_summary_with_branch_plot.R
+#!/usr/bin/env Rscript
+# 用法:
+# Rscript rloop_summary_with_branch_plot.R rloop_summary_changed_with_branch_sorted.tsv summary_plots
+#
+# 第1个参数: 输入TSV
+# 第2个参数: 输出目录
+#
+# 如果不传参数，默认:
+# input  = "rloop_summary_changed_with_branch_sorted.tsv"
+# outdir = "summary_plots"
+
+args <- commandArgs(trailingOnly = TRUE)
+input_file <- if (length(args) >= 1) args[1] else "rloop_summary_changed_with_branch_sorted.tsv"
+outdir     <- if (length(args) >= 2) args[2] else "summary_plots"
+
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+# ----------------------------
+# 依赖包
+# ----------------------------
+need_pkgs <- c("readr", "dplyr", "ggplot2", "forcats", "stringr")
+for (pkg in need_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop(sprintf("缺少R包: %s\n请先安装: install.packages('%s')", pkg, pkg))
+  }
+}
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(stringr)
+# ----------------------------
+# 读取数据
+# ----------------------------
+df <- read_tsv(
+  input_file,
+  show_col_types = FALSE,
+  locale = locale(encoding = "UTF-8")
+)
+
+# 检查必要列
+required_cols <- c(
+  "物种", "亚科", "主要分支", "染色体数", "主染色体总长度",
+  "Rloop区域数", "总覆盖长度", "平均区域长度",
+  "每100Mb区域数", "Rloop覆盖比例", "平均每条染色体区域数"
+)
+
+missing_cols <- setdiff(required_cols, colnames(df))
+if (length(missing_cols) > 0) {
+  stop("缺少必要列: ", paste(missing_cols, collapse = ", "))
+}
+
+# 数值列强制转数值，防止读成字符
+num_cols <- c(
+  "染色体数", "主染色体总长度", "Rloop区域数", "总覆盖长度",
+  "平均区域长度", "每100Mb区域数", "Rloop覆盖比例", "平均每条染色体区域数"
+)
+
+df <- df %>%
+  mutate(across(all_of(num_cols), as.numeric))
+
+# 物种简写：去掉 accession，保留属种名
+df <- df %>%
+  mutate(
+    物种简称 = 物种 %>%
+      str_replace("_GCA_.*$", "") %>%
+      str_replace("_GCF_.*$", "") %>%
+      str_replace_all("_", " "),
+    分支分组 = paste(亚科, 主要分支, sep = " | ")
+  )
+branch_order <- c(
+  "Cercidoideae | basal_non_papilionoid",
+  "Detarioideae | basal_non_papilionoid",
+  "Dialioideae | basal_non_papilionoid",
+  "Caesalpinioideae | Cassieae",
+  "Caesalpinioideae | Mimoseae",
+  "Papilionoideae | dalbergioid",
+  "Papilionoideae | genistoid",
+  "Papilionoideae | IRLC",
+  "Papilionoideae | millettioid_phaseoloid"
+)
+
+df <- df %>%
+  mutate(`分支分组` = factor(`分支分组`, levels = branch_order))
+
+# 输出清洗后的表
+write_tsv(df, file.path(outdir, "rloop_summary_cleaned.tsv"))
+
+# ----------------------------
+# 主题设置
+# ----------------------------
+theme_set(
+  theme_bw(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+      plot.title = element_text(face = "bold"),
+      legend.title = element_text(face = "bold")
+    )
+)
+
+save_plot <- function(p, filename, width = 10, height = 6) {
+  filepath <- file.path(outdir, filename)
+  if (grepl("\\.pdf$", filename, ignore.case = TRUE)) {
+    ggsave(
+      filename = filepath,
+      plot = p,
+      width = width,
+      height = height,
+      device = grDevices::cairo_pdf
+    )
+  } else {
+    ggsave(
+      filename = filepath,
+      plot = p,
+      width = width,
+      height = height,
+      dpi = 300
+    )
+  }
+}
+
+# ----------------------------
+# 1. 物种级：Rloop覆盖比例排序条形图
+# ----------------------------
+df_cov <- df %>%
+  arrange(`Rloop覆盖比例`) %>%
+  mutate(物种简称 = factor(物种简称, levels = 物种简称))
+
+p1 <- ggplot(df_cov, aes(x = 物种简称, y = `Rloop覆盖比例`, fill = `分支分组`)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "各物种R-loop覆盖比例",
+    x = "物种",
+    y = "R-loop覆盖比例"
+  )
+
+save_plot(p1, "01_species_cov_ratio_bar.png", width = 10, height = 9)
+save_plot(p1, "01_species_cov_ratio_bar.pdf", width = 10, height = 9)
+
+# ----------------------------
+# 2. 物种级：每100Mb区域数排序条形图
+# ----------------------------
+df_density <- df %>%
+  arrange(`每100Mb区域数`) %>%
+  mutate(物种简称 = factor(物种简称, levels = 物种简称))
+
+p2 <- ggplot(df_density, aes(x = 物种简称, y = `每100Mb区域数`, fill = `分支分组`)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "各物种每100Mb的R-loop区域数",
+    x = "物种",
+    y = "每100Mb区域数"
+  )
+
+save_plot(p2, "02_species_density_bar.png", width = 10, height = 9)
+save_plot(p2, "02_species_density_bar.pdf", width = 10, height = 9)
+
+# ----------------------------
+# 3. 物种级：平均区域长度排序条形图
+# ----------------------------
+df_len <- df %>%
+  arrange(`平均区域长度`) %>%
+  mutate(物种简称 = factor(物种简称, levels = 物种简称))
+
+p3 <- ggplot(df_len, aes(x = 物种简称, y = `平均区域长度`, fill = `分支分组`)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "各物种R-loop平均区域长度",
+    x = "物种",
+    y = "平均区域长度"
+  )
+
+save_plot(p3, "03_species_mean_length_bar.png", width = 10, height = 9)
+save_plot(p3, "03_species_mean_length_bar.pdf", width = 10, height = 9)
+
+# ----------------------------
+# 4. 分支分组：覆盖比例箱线图
+# ----------------------------
+df_branch_cov <- df
+
+p4 <- ggplot(df_branch_cov, aes(x = `分支分组`, y = `Rloop覆盖比例`, fill = `分支分组`)) +
+  geom_boxplot(outlier.shape = 21, outlier.size = 2) +
+  geom_jitter(width = 0.15, alpha = 0.7, size = 2) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 18)) +
+  labs(
+    title = "不同亚科-分支的R-loop覆盖比例",
+    x = "亚科 | 主要分支",
+    y = "R-loop覆盖比例"
+  ) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1),
+    plot.margin = margin(t = 10, r = 10, b = 35, l = 35)
+  )
+
+save_plot(p4, "04_branch_cov_ratio_boxplot.png", width = 10, height = 6)
+save_plot(p4, "04_branch_cov_ratio_boxplot.pdf", width = 10, height = 6)
+
+# ----------------------------
+# 5. 分支分组：每100Mb区域数箱线图
+# ----------------------------
+df_branch_density <- df
+
+p5 <- ggplot(df_branch_density, aes(x = `分支分组`, y = `每100Mb区域数`, fill = `分支分组`)) +
+  geom_boxplot(outlier.shape = 21, outlier.size = 2) +
+  geom_jitter(width = 0.15, alpha = 0.7, size = 2) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 18)) +
+  labs(
+    title = "不同亚科-分支的R-loop密度",
+    x = "亚科 | 主要分支",
+    y = "每100Mb区域数"
+  ) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1),
+    plot.margin = margin(t = 10, r = 10, b = 35, l = 35)
+  )
+
+save_plot(p5, "05_branch_density_boxplot.png", width = 10, height = 6)
+save_plot(p5, "05_branch_density_boxplot.pdf", width = 10, height = 6)
+
+# ----------------------------
+# 6. 分支分组：平均区域长度箱线图
+# ----------------------------
+df_branch_len <- df
+
+p6 <- ggplot(df_branch_len, aes(x = `分支分组`, y = `平均区域长度`, fill = `分支分组`)) +
+  geom_boxplot(outlier.shape = 21, outlier.size = 2) +
+  geom_jitter(width = 0.15, alpha = 0.7, size = 2) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 18)) +
+  labs(
+    title = "不同亚科-分支的R-loop平均区域长度",
+    x = "亚科 | 主要分支",
+    y = "平均区域长度"
+  ) +
+ theme(
+   legend.position = "none",
+   axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1),
+   plot.margin = margin(t = 10, r = 10, b = 35, l = 35)
+ )
+
+save_plot(p6, "06_branch_mean_length_boxplot.png", width = 10, height = 6)
+save_plot(p6, "06_branch_mean_length_boxplot.pdf", width = 10, height = 6)
+
+# ----------------------------
+# 7. 亚科：覆盖比例箱线图
+# ----------------------------
+df_sub_cov <- df %>%
+  mutate(亚科 = fct_reorder(亚科, `Rloop覆盖比例`, .fun = median, .desc = FALSE))
+
+p7 <- ggplot(df_sub_cov, aes(x = 亚科, y = `Rloop覆盖比例`, fill = 亚科)) +
+  geom_boxplot(outlier.shape = 21, outlier.size = 2) +
+  geom_jitter(width = 0.15, alpha = 0.7, size = 2) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 18)) +
+  labs(
+    title = "不同亚科的R-loop覆盖比例",
+    x = "亚科",
+    y = "R-loop覆盖比例"
+  ) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1),
+    plot.margin = margin(t = 10, r = 10, b = 35, l = 35)
+  )
+
+save_plot(p7, "07_subfamily_cov_ratio_boxplot.png", width = 9, height = 6)
+save_plot(p7, "07_subfamily_cov_ratio_boxplot.pdf", width = 9, height = 6)
+
+# ----------------------------
+# 8. 散点图：密度 vs 覆盖比例
+# ----------------------------
+p8 <- ggplot(df, aes(x = `每100Mb区域数`, y = `Rloop覆盖比例`, color = `分支分组`)) +
+  geom_point(size = 3, alpha = 0.9) +
+  labs(
+    title = "R-loop密度与覆盖比例的关系",
+    x = "每100Mb区域数",
+    y = "R-loop覆盖比例",
+    color = "亚科 | 主要分支"
+  )
+
+save_plot(p8, "08_density_vs_covratio_scatter.png", width = 8, height = 6)
+save_plot(p8, "08_density_vs_covratio_scatter.pdf", width = 8, height = 6)
+
+# ----------------------------
+# 9. 散点图：平均区域长度 vs 覆盖比例
+# ----------------------------
+p9 <- ggplot(df, aes(x = `平均区域长度`, y = `Rloop覆盖比例`, color = `分支分组`)) +
+  geom_point(size = 3, alpha = 0.9) +
+  labs(
+    title = "平均区域长度与覆盖比例的关系",
+    x = "平均区域长度",
+    y = "R-loop覆盖比例",
+    color = "亚科 | 主要分支"
+  )
+
+save_plot(p9, "09_meanlength_vs_covratio_scatter.png", width = 8, height = 6)
+save_plot(p9, "09_meanlength_vs_covratio_scatter.pdf", width = 8, height = 6)
+
+# ----------------------------
+# 10. 输出分组统计表
+# ----------------------------
+branch_summary <- df %>%
+  group_by(`分支分组`) %>%
+  summarise(
+    物种数 = n(),
+    覆盖比例_中位数 = median(`Rloop覆盖比例`, na.rm = TRUE),
+    覆盖比例_平均值 = mean(`Rloop覆盖比例`, na.rm = TRUE),
+    密度_中位数 = median(`每100Mb区域数`, na.rm = TRUE),
+    密度_平均值 = mean(`每100Mb区域数`, na.rm = TRUE),
+    平均长度_中位数 = median(`平均区域长度`, na.rm = TRUE),
+    平均长度_平均值 = mean(`平均区域长度`, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(覆盖比例_中位数))
+
+write_tsv(branch_summary, file.path(outdir, "branch_summary.tsv"))
+
+subfamily_summary <- df %>%
+  group_by(`亚科`) %>%
+  summarise(
+    物种数 = n(),
+    覆盖比例_中位数 = median(`Rloop覆盖比例`, na.rm = TRUE),
+    覆盖比例_平均值 = mean(`Rloop覆盖比例`, na.rm = TRUE),
+    密度_中位数 = median(`每100Mb区域数`, na.rm = TRUE),
+    密度_平均值 = mean(`每100Mb区域数`, na.rm = TRUE),
+    平均长度_中位数 = median(`平均区域长度`, na.rm = TRUE),
+    平均长度_平均值 = mean(`平均区域长度`, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(覆盖比例_中位数))
+
+write_tsv(subfamily_summary, file.path(outdir, "subfamily_summary.tsv"))
+
+cat("完成。\n")
+cat("输入文件: ", normalizePath(input_file), "\n", sep = "")
+cat("输出目录: ", normalizePath(outdir), "\n", sep = "")
+
+# GTF转bed
+vim build_annotation_beds_from_anno.sh
+#!/usr/bin/env bash
+set -euo pipefail
+# 用法:
+# bash build_annotation_beds_from_anno.sh \
+#   <annotation.gtf/gff/gff3> \
+#   <chromsize> \
+#   <outdir> \
+#   [promoter_bp]
+#
+# 例子:
+# bash build_annotation_beds_from_anno.sh \
+#   /data/mshe/deepRloopPro_data/GTF_find/genome_file/Chamaecrista_fasciculata_LIS_genomic.gff3 \
+#   /data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Chamaecrista_fasciculata_LIS.chromsize \
+#   /data/mshe/deepRloopPro_data/annotation_beds_new/Chamaecrista_fasciculata_LIS \
+#   2000
+
+if [[ $# -lt 3 ]]; then
+  echo "Usage: bash $0 <annotation.gtf/gff/gff3> <chromsize> <outdir> [promoter_bp]" >&2
+  exit 1
+fi
+
+ANNO="$1"
+CHROMSIZE="$2"
+OUTDIR="$3"
+PROMOTER_BP="${4:-2000}"
+
+mkdir -p "$OUTDIR"
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "[ERROR] missing command: $1" >&2
+    exit 1
+  }
+}
+
+need_cmd awk
+need_cmd sort
+need_cmd bedtools
+
+if [[ ! -f "$ANNO" ]]; then
+  echo "[ERROR] annotation file not found: $ANNO" >&2
+  exit 1
+fi
+
+if [[ ! -f "$CHROMSIZE" ]]; then
+  echo "[ERROR] chromsize not found: $CHROMSIZE" >&2
+  exit 1
+fi
+
+echo "[INFO] annotation  = $ANNO"
+echo "[INFO] chromsize   = $CHROMSIZE"
+echo "[INFO] outdir      = $OUTDIR"
+echo "[INFO] promoter_bp = $PROMOTER_BP"
+
+# 1) gene body
+# GTF/GFF3: 1-based inclusive
+# BED: 0-based half-open
+# 用 chromsize 第一列限制分析范围，和 deepRloop 预测一致
+awk 'BEGIN{FS=OFS="\t"}
+     FNR==NR {
+       keep[$1] = 1
+       next
+     }
+     $0 !~ /^#/ && $3 == "gene" && ($1 in keep) {
+       start = $4 - 1
+       if (start < 0) start = 0
+       print $1, start, $5, $9, ".", $7
+     }' "$CHROMSIZE" "$ANNO" \
+  | sort -k1,1 -k2,2n -k3,3n \
+  > "$OUTDIR/gene_body.bed"
+
+gene_n=$(wc -l < "$OUTDIR/gene_body.bed")
+if [[ "$gene_n" -eq 0 ]]; then
+  echo "[ERROR] no gene features found after filtering by chromsize." >&2
+  echo "[HINT] Check whether annotation seqids match chromsize seqids." >&2
+  exit 1
+fi
+
+echo "[INFO] gene features retained: $gene_n"
+
+# 2) promoter
+# + strand: [TSS-UP, TSS-1]
+# - strand: [TES+1, TES+UP]
+awk -v UP="$PROMOTER_BP" 'BEGIN{FS=OFS="\t"}
+     FNR==NR {
+       chrlen[$1] = $2
+       next
+     }
+     $0 !~ /^#/ && $3 == "gene" {
+       if (!($1 in chrlen)) next
+
+       if ($7 == "+") {
+         s = $4 - UP - 1
+         if (s < 0) s = 0
+         e = $4 - 1
+         if (e > s) print $1, s, e, $9, ".", $7
+       }
+       else if ($7 == "-") {
+         s = $5
+         e = $5 + UP
+         if (e > chrlen[$1]) e = chrlen[$1]
+         if (e > s) print $1, s, e, $9, ".", $7
+       }
+     }' "$CHROMSIZE" "$ANNO" \
+  | sort -k1,1 -k2,2n -k3,3n \
+  > "$OUTDIR/promoter_${PROMOTER_BP}bp.bed"
+
+# 3) merge gene body
+cut -f1-3 "$OUTDIR/gene_body.bed" \
+  | sort -k1,1 -k2,2n -k3,3n \
+  | bedtools merge -i - \
+  > "$OUTDIR/gene_body.merged.bed"
+
+# 4) merge promoter
+cut -f1-3 "$OUTDIR/promoter_${PROMOTER_BP}bp.bed" \
+  | sort -k1,1 -k2,2n -k3,3n \
+  | bedtools merge -i - \
+  > "$OUTDIR/promoter_${PROMOTER_BP}bp.merged.bed"
+
+# 5) gene + promoter union
+cat "$OUTDIR/gene_body.merged.bed" "$OUTDIR/promoter_${PROMOTER_BP}bp.merged.bed" \
+  | sort -k1,1 -k2,2n -k3,3n \
+  | bedtools merge -i - \
+  > "$OUTDIR/gene_plus_promoter.merged.bed"
+
+# 6) intergenic = genome - (gene + promoter)
+bedtools complement \
+  -i "$OUTDIR/gene_plus_promoter.merged.bed" \
+  -g "$CHROMSIZE" \
+  > "$OUTDIR/intergenic.bed"
+
+# 7) total bp summary
+awk 'BEGIN{s=0} {s+=($3-$2)} END{print s+0}' "$OUTDIR/gene_body.merged.bed" \
+  > "$OUTDIR/gene_body.total_bp.txt"
+
+awk 'BEGIN{s=0} {s+=($3-$2)} END{print s+0}' "$OUTDIR/promoter_${PROMOTER_BP}bp.merged.bed" \
+  > "$OUTDIR/promoter_${PROMOTER_BP}bp.total_bp.txt"
+
+awk 'BEGIN{s=0} {s+=($3-$2)} END{print s+0}' "$OUTDIR/intergenic.bed" \
+  > "$OUTDIR/intergenic.total_bp.txt"
+
+echo "[OK] BED files created:"
+echo "  $OUTDIR/gene_body.bed"
+echo "  $OUTDIR/promoter_${PROMOTER_BP}bp.bed"
+echo "  $OUTDIR/intergenic.bed"
+
+chmod +x build_annotation_beds_from_anno.sh
+bash build_annotation_beds_from_anno.sh \
+  /data/mshe/deepRloopPro_data/GTF_find/genome_file/Chamaecrista_fasciculata_LIS_genomic.gff3 \
+  /data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Chamaecrista_fasciculata_LIS.chromsize \
+  /data/mshe/deepRloopPro_data/annotation_beds/Chamaecrista_fasciculata_LIS \
+  2000
+
+cat > annotation_list_new.tsv <<'EOF'
+Bauhinia_variegata_GCA_022379115.2	/data/mshe/deepRloopPro_data/GTF_find/genome_file/Bauhinia_variegata_GCA_022379115.2_genomic.gtf	/data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Bauhinia_variegata_GCA_022379115.2.chromsize
+Senna_tora_GCA_014851425.1	/data/mshe/deepRloopPro_data/genome_file/Senna_tora_GCA_014851425.1/ncbi_dataset/data/GCA_014851425.1/genomic.gtf	/data/mshe/deepRloopPro_data/chromsize_primary/Senna_tora_GCA_014851425.1.chromsize
+Chamaecrista_fasciculata_LIS	/data/mshe/deepRloopPro_data/GTF_find/genome_file/Chamaecrista_fasciculata_LIS_genomic.gff3	/data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Chamaecrista_fasciculata_LIS.chromsize
+Crotalaria_pallida_GCA_037953625.1	/data/mshe/deepRloopPro_data/GTF_find/genome_file/Crotalaria_pallida_GCA_037953625.1_genomic.gtf	/data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Crotalaria_pallida_GCA_037953625.1.chromsize
+Lupinus_angustifolius_GCA_001865875.1	/data/mshe/deepRloopPro_data/GTF_find/genome_file/Lupinus_angustifolius_GCA_001865875.1_genomic.gtf	/data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Lupinus_angustifolius_GCA_001865875.1.chromsize
+Arachis_hypogaea_GCA_039854485.1	/data/mshe/deepRloopPro_data/genome_file/Arachis_hypogaea_GCA_039854485.1/ncbi_dataset/data/GCA_039854485.1/genomic.gtf	/data/mshe/deepRloopPro_data/chromsize_primary/Arachis_hypogaea_GCA_039854485.1.chromsize
+Medicago_truncatula_GCA_003473485.2	/data/mshe/deepRloopPro_data/genome_file/Medicago_truncatula_GCA_003473485.2/ncbi_dataset/data/GCF_003473485.1/genomic.gtf	/data/mshe/deepRloopPro_data/chromsize_primary/Medicago_truncatula_GCA_003473485.2.chromsize
+Cicer_arietinum_GCA_000331145.2	/data/mshe/deepRloopPro_data/genome_file/Cicer_arietinum_GCA_000331145.2/ncbi_dataset/data/GCF_000331145.2/genomic.gtf	/data/mshe/deepRloopPro_data/chromsize_primary/Cicer_arietinum_GCA_000331145.2.chromsize
+Vicia_faba_GCA_948472305.1	/data/mshe/deepRloopPro_data/GTF_find/genome_file/Vicia_faba_GCA_948472305.1_genomic.gtf	/data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Vicia_faba_GCA_948472305.1.chromsize
+Lathyrus_oleraceus_GCA_964186695.1	/data/mshe/deepRloopPro_data/GTF_find/genome_file/Lathyrus_oleraceus_GCA_964186695.1_genomic.gtf	/data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Lathyrus_oleraceus_GCA_964186695.1.chromsize
+Trifolium_repens_GCA_030408175.1	/data/mshe/deepRloopPro_data/genome_file/Trifolium_repens_GCA_030408175.1/ncbi_dataset/data/GCA_030408175.1/genomic.gtf	/data/mshe/deepRloopPro_data/chromsize_primary/Trifolium_repens_GCA_030408175.1.chromsize
+Glycine_max_GCA_000004515.5	/data/mshe/deepRloopPro_data/genome_file/Glycine_max_GCA_000004515.5/ncbi_dataset/data/GCF_000004515.6/genomic.gtf	/data/mshe/deepRloopPro_data/chromsize_primary/Glycine_max_GCA_000004515.5.chromsize
+Phaseolus_vulgaris_GCA_000499845.2	/data/mshe/deepRloopPro_data/GTF_find/genome_file/Phaseolus_vulgaris_GCA_000499845.2_genomic.gtf	/data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Phaseolus_vulgaris_GCA_000499845.2.chromsize
+Vigna_radiata_GCF_000741045.2	/data/mshe/deepRloopPro_data/GTF_find/genome_file/Vigna_radiata_GCF_000741045.2_genomic.gtf	/data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Vigna_radiata_GCF_000741045.2.chromsize
+Cajanus_cajan_GCF_000340665.2	/data/mshe/deepRloopPro_data/GTF_find/genome_file/Cajanus_cajan_GCF_000340665.2_genomic.gtf	/data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Cajanus_cajan_GCF_000340665.2.chromsize
+Lablab_purpureus_LIS	/data/mshe/deepRloopPro_data/GTF_find/genome_file/Lablab_purpureus_LIS_genomic.gff3	/data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Lablab_purpureus_LIS.chromsize
+EOF
+#检查路径
+awk -F'\t' '
+{
+  if (system("[ -s \""$2"\" ]") != 0) print "[MISSING ANNO] "$1"\t"$2
+  if (system("[ -s \""$3"\" ]") != 0) print "[MISSING CHROMSIZE] "$1"\t"$3
+}
+' annotation_list_new.tsv
+#无输出则进行批量跑
+OUTROOT=/data/mshe/deepRloopPro_data/annotation_beds
+SCRIPT=/data/mshe/deepRloopPro_data/build_annotation_beds_from_anno.sh
+PROMOTER_BP=2000
+mkdir -p "$OUTROOT"
+while IFS=$'\t' read -r sp anno chrom
+do
+    echo "=================================================="
+    echo "[INFO] processing $sp"
+    bash "$SCRIPT" "$anno" "$chrom" "$OUTROOT/$sp" "$PROMOTER_BP"
+done < /data/mshe/deepRloopPro_data/annotation_list_new.tsv
+# Vivia有报错，问题为chromsize顺序与bed文件不同，修改build_annotation_beds_from_anno.sh，将里面的sort -k1,1 -k2,2n -k3,3n换成bedtools sort -g "$CHROMISIZE" -i -
+rm -rf /data/mshe/deepRloopPro_data/annotation_beds/Vicia_faba_GCA_948472305.1
+bash build_annotation_beds_from_anno.sh \
+  /data/mshe/deepRloopPro_data/GTF_find/genome_file/Vicia_faba_GCA_948472305.1_genomic.gtf \
+  /data/mshe/deepRloopPro_data/GTF_find/chromsize_primary/Vicia_faba_GCA_948472305.1.chromsize \
+  /data/mshe/deepRloopPro_data/annotation_beds/Vicia_faba_GCA_948472305.1 \
+  2000
+#检查，应返回16
+find /data/mshe/deepRloopPro_data/annotation_beds -maxdepth 2 -name "gene_body.bed" | wc -l
+find /data/mshe/deepRloopPro_data/annotation_beds -maxdepth 2 -name "promoter_2000bp.bed" | wc -l
+find /data/mshe/deepRloopPro_data/annotation_beds -maxdepth 2 -name "intergenic.bed" | wc -l
+
+#检查annotation：gene数量、gene_body总长度、promoter总长度和intergenic总长度
+for d in annotation_beds/*
+do
+    sp=$(basename "$d")
+    n=$(wc -l < "$d/gene_body.bed")
+    echo -e "$sp\t$n"
+done
+for d in annotation_beds/*
+do
+    sp=$(basename "$d")
+    bp=$(cat "$d/gene_body.total_bp.txt")
+    echo -e "$sp\t$bp"
+done
+for d in annotation_beds/*
+do
+    sp=$(basename "$d")
+    gene_bp=$(cat "$d/gene_body.total_bp.txt")
+    prom_bp=$(cat "$d/promoter_2000bp.total_bp.txt")
+    inter_bp=$(cat "$d/intergenic.total_bp.txt")
+    echo -e "$sp\tgene_bp=$gene_bp\tpromoter_bp=$prom_bp\tintergenic_bp=$inter_bp"
+done
+
+#生成四个不重叠的区域
+ANNROOT=/data/mshe/deepRloopPro_data/annotation_beds
+SCRIPT=/data/mshe/deepRloopPro_data/make_exclusive_regions.sh
+PROMOTER_BP=2000
+cut -f1 /data/mshe/deepRloopPro_data/annotation_list_new.tsv | while read -r sp
+do
+    echo "=================================================="
+    echo "[INFO] make four regions: $sp"
+
+    bash "$SCRIPT" \
+      "$ANNROOT/$sp" \
+      "$PROMOTER_BP"
+done
+
+#对四个区域与rloop进行overlap
+RESROOT=/data/mshe/deepRloopPro_data/deepRloop_results_A
+ANNROOT=/data/mshe/deepRloopPro_data/annotation_beds
+OUTROOT=/data/mshe/deepRloopPro_data/region_overlap_four
+SCRIPT=/data/mshe/deepRloopPro_data/rloop_overlap_four_regions.sh
+mkdir -p "$OUTROOT"
+cut -f1 /data/mshe/deepRloopPro_data/annotation_list_new.tsv | while read -r sp
+do
+    finalbed="$RESROOT/${sp}_final_predict.bed"
+    anndir="$ANNROOT/$sp"
+
+    echo "=================================================="
+    echo "[INFO] overlap four regions: $sp"
+
+    if [[ ! -s "$finalbed" ]]; then
+        echo "[WARN] missing finalbed: $finalbed"
+        continue
+    fi
+
+    bash "$SCRIPT" \
+      "$sp" \
+      "$finalbed" \
+      "$anndir" \
+      "$OUTROOT"
+done
+
+#合并结果
+cd /data/mshe/deepRloopPro_data/region_overlap_four
+first=$(ls *.region_overlap_four.tsv | head -n 1)
+head -n 1 "$first" > all_species_region_overlap_four.tsv
+for f in *.region_overlap_four.tsv
+do
+    tail -n +2 "$f" >> all_species_region_overlap_four.tsv
+done
+column -t -s $'\t' all_species_region_overlap_four.tsv | less -S
+#与分支映射
+cd /data/mshe/deepRloopPro_data
+MAP=species_branch_map_20.tsv
+IN=region_overlap_four/all_species_region_overlap_four.tsv
+OUT=region_overlap_four/all_species_region_overlap_four_with_branch.tsv
+awk 'BEGIN{FS=OFS="\t"}
+NR==FNR {
+    if (FNR==1) next
+    subfamily[$1]=$2
+    branch[$1]=$3
+    next
+}
+FNR==1 {
+    print "species","亚科","主要分支",$2,$3,$4,$5,$6,$7,$8,$9,$10
+    next
+}
+{
+    sp=$1
+    sf=(sp in subfamily ? subfamily[sp] : "NA")
+    br=(sp in branch ? branch[sp] : "NA")
+    if (sf=="NA" || br=="NA") {
+        print "[WARN] species not found in map: " sp > "/dev/stderr"
+    }
+    print sp,sf,br,$2,$3,$4,$5,$6,$7,$8,$9,$10
+}' "$MAP" "$IN" > "$OUT"
+echo "已生成: $OUT"
+column -t -s $'\t' all_species_region_overlap_four_with_branch.tsv | less -S
+#生成带分支信息的图
+Rscript plot_region_overlap_four.R \
+  /data/mshe/deepRloopPro_data/region_overlap_four/all_species_region_overlap_four_with_branch.tsv \
+  /data/mshe/deepRloopPro_data/region_overlap_four/plots
