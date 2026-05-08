@@ -1,3 +1,201 @@
+# 在基因组原文出找到了Dalbergia_cochinchinensis_GCA_031216125.1的 gff 文件（文章来源：Chromosome-scale genomes of five Hongmu species in Leguminosae）
+zcat Dalbergia_cochinchinensis.chr.gff.gz | awk '$1 !~ /^#/ {print $1}' | sort -u > Dalbergia_cochinchinensis.chr.gff.seqid.txt
+grep ">" /data/mshe/deepRloopPro_data/genome_file/Dalbergia_cochinchinensis_GCA_031216125.1/ncbi_dataset/data/GCA_031216125.1/GCA_031216125.1_Dcoc_1.0_genomic.fna | sed 's/>//' | awk '{print $1}' | sort -u > Dalbergia_cochinchinensis.fa.seqid.txt
+comm -3 Dalbergia_cochinchinensis.chr.gff.seqid.txt Dalbergia_cochinchinensis.fa.seqid.txt
+cat > Dalbergia_cochinchinensis_GCA_031216125.1.chr.rename.map <<'EOF'
+Chr1	CM062368.1
+Chr2	CM062369.1
+Chr3	CM062370.1
+Chr4	CM062371.1
+Chr5	CM062372.1
+Chr6	CM062373.1
+Chr7	CM062374.1
+Chr8	CM062375.1
+Chr9	CM062376.1
+Chr10	CM062377.1
+EOF
+zcat Dalbergia_cochinchinensis.chr.gff.gz | \
+awk 'BEGIN{OFS="\t"}
+     FNR==NR{
+       map[$1]=$2;
+       keep[$1]=1;
+       next
+     }
+     /^##sequence-region/ {
+       if ($2 in map) {
+         $2=map[$2];
+         print
+       }
+       next
+     }
+     /^#/ {
+       print;
+       next
+     }
+     {
+       if ($1 in map) {
+         $1=map[$1];
+         print
+       }
+     }' Dalbergia_cochinchinensis_GCA_031216125.1.chr.rename.map - \
+> /data/mshe/deepRloopPro_data/genome_file/Dalbergia_cochinchinensis_GCA_031216125.1/Dalbergia_cochinchinensis_GCA_031216125.1.chr10.NCBIseqid.gff
+awk '$1 !~ /^#/ {print $1}' /data/mshe/deepRloopPro_data/genome_file/Dalbergia_cochinchinensis_GCA_031216125.1/Dalbergia_cochinchinensis_GCA_031216125.1.chr10.NCBIseqid.gff | sort -u
+## 找到了Zenia的文章有gff，比对文章的基因组文件和ncbi的基因组文件发现二者基因组文件一致，可以用这个的gff文件（文章：Chromosome-level reference genome assembly for the protected resource plant, Zenia insignis）
+awk '$1 !~ /^#/ {print $1}' Zenia_insignis.gff3 | sort -u > Zenia_insignis.gtf.seqid.txt
+grep ">" /data/mshe/deepRloopPro_data/genome_file/Zenia_insignis_GCA_052059195.1/ncbi_dataset/data/GCA_052059195.1/GCA_052059195.1_KIB_Zeins_1.0_genomic.fna | sed 's/>//' | awk '{print $1}' | sort -u > Zenia_insignis_GCA_052059195.1.ncbifa.seqid.txt
+comm -3 Zenia_insignis.gtf.seqid.txt Zenia_insignis_GCA_052059195.1.ncbifa.seqid.txt
+cat > zenia_chr.map <<'EOF'
+chr01_Zeins	CM125413.1
+chr02_Zeins	CM125414.1
+chr03_Zeins	CM125415.1
+chr04_Zeins	CM125416.1
+chr05_Zeins	CM125417.1
+chr06_Zeins	CM125418.1
+chr07_Zeins	CM125419.1
+chr08_Zeins	CM125420.1
+chr09_Zeins	CM125421.1
+chr10_Zeins	CM125422.1
+chr11_Zeins	CM125423.1
+chr12_Zeins	CM125424.1
+chr13_Zeins	CM125425.1
+chr14_Zeins	CM125426.1
+EOF
+#检查基因组文件是否一致
+vim check_fasta_identity.py
+#!/usr/bin/env python3
+import sys
+import gzip
+import hashlib
+
+def open_maybe_gz(path):
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt")
+    return open(path, "r")
+
+def read_fasta(path):
+    seqs = {}
+    name = None
+    chunks = []
+    with open_maybe_gz(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if name is not None:
+                    seqs[name] = "".join(chunks).upper()
+                name = line[1:].split()[0]
+                chunks = []
+            else:
+                chunks.append(line)
+        if name is not None:
+            seqs[name] = "".join(chunks).upper()
+    return seqs
+
+def md5seq(seq):
+    return hashlib.md5(seq.encode()).hexdigest()
+
+def revcomp(seq):
+    table = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+    return seq.translate(table)[::-1].upper()
+
+if len(sys.argv) != 4:
+    sys.exit("Usage: python check_fasta_identity.py article.fa ncbi.fa zenia_chr.map")
+
+article_fa, ncbi_fa, map_file = sys.argv[1:4]
+
+article = read_fasta(article_fa)
+ncbi = read_fasta(ncbi_fa)
+
+all_ok = True
+
+with open(map_file) as f:
+    for line in f:
+        if not line.strip() or line.startswith("#"):
+            continue
+        a_id, n_id = line.strip().split()[:2]
+
+        if a_id not in article:
+            print(f"MISSING in article fasta: {a_id}")
+            all_ok = False
+            continue
+        if n_id not in ncbi:
+            print(f"MISSING in NCBI fasta: {n_id}")
+            all_ok = False
+            continue
+
+        a_seq = article[a_id]
+        n_seq = ncbi[n_id]
+
+        a_md5 = md5seq(a_seq)
+        n_md5 = md5seq(n_seq)
+
+        if len(a_seq) == len(n_seq) and a_md5 == n_md5:
+            print(f"OK\t{a_id}\t{n_id}\tlen={len(a_seq)}\tmd5={a_md5}")
+        elif len(a_seq) == len(n_seq) and md5seq(revcomp(a_seq)) == n_md5:
+            print(f"REVERSE_COMPLEMENT\t{a_id}\t{n_id}\tlen={len(a_seq)}")
+            all_ok = False
+        else:
+            print(f"DIFFERENT\t{a_id}\t{n_id}\tarticle_len={len(a_seq)}\tncbi_len={len(n_seq)}\tarticle_md5={a_md5}\tncbi_md5={n_md5}")
+            all_ok = False
+
+if all_ok:
+    print("RESULT: all mapped chromosomes are identical.")
+else:
+    print("RESULT: some mapped chromosomes are not identical.")
+
+chmod +x check_fasta_identity.py
+python check_fasta_identity.py Zenia_insignis.fas /data/mshe/deepRloopPro_data/genome_file/Zenia_insignis_GCA_052059195.1/ncbi_dataset/data/GCA_052059195.1/GCA_052059195.1_KIB_Zeins_1.0_genomic.fna zenia_chr.map
+#结果显示完全一致，碱基序列也完全相同，将注释文件的seqid转成NCBI格式
+awk 'BEGIN{OFS="\t"}
+     FNR==NR{map[$1]=$2; next}
+     /^#/ {print; next}
+     {
+       if ($1 in map) {
+         $1=map[$1];
+         print
+       }
+     }' zenia_chr.map Zenia_insignis.gff3 \
+> /data/mshe/deepRloopPro_data/genome_file/Zenia_insignis_GCA_052059195.1/Zenia_insignis.GCA_052059195.1.chr14.NCBIseqid.gff3
+awk '$1 !~ /^#/ {print $1}' /data/mshe/deepRloopPro_data/genome_file/Zenia_insignis_GCA_052059195.1/Zenia_insignis.GCA_052059195.1.chr14.NCBIseqid.gff3 | sort -u
+## 在 LegumeInfo 网站找到了 Sindora 的 gff和 fna，比对发现基因组信息与ncbi版一样，转换seqid后可用
+samtools faidx singl.CAF01.gnm1.0JHK.genome_main.fna.gz
+cut -f1,2 singl.CAF01.gnm1.0JHK.genome_main.fna.gz.fai \
+> sindora.legumeinfo.chromsize
+head -n 20 sindora.legumeinfo.chromsize
+head -n 20 /data/mshe/deepRloopPro_data/chromsize_primary/Sindora_glabra_GCA_020226215.1.chromsize
+cat > sindora_chr.map <<'EOF'
+singl.CAF01.gnm1.Chr01	CM035225.1
+singl.CAF01.gnm1.Chr02	CM035226.1
+singl.CAF01.gnm1.Chr03	CM035227.1
+singl.CAF01.gnm1.Chr04	CM035228.1
+singl.CAF01.gnm1.Chr05	CM035229.1
+singl.CAF01.gnm1.Chr06	CM035230.1
+singl.CAF01.gnm1.Chr07	CM035231.1
+singl.CAF01.gnm1.Chr08	CM035232.1
+singl.CAF01.gnm1.Chr09	CM035233.1
+singl.CAF01.gnm1.Chr10	CM035234.1
+singl.CAF01.gnm1.Chr11	CM035235.1
+singl.CAF01.gnm1.Chr12	CM035236.1
+EOF
+python check_fasta_identity.py \
+  singl.CAF01.gnm1.0JHK.genome_main.fna.gz \
+  /data/mshe/deepRloopPro_data/genome_file/Sindora_glabra_GCA_020226215.1/ncbi_dataset/data/GCA_020226215.1/GCA_020226215.1_CAF_Sgla_1.0_genomic.fna \
+  sindora_chr.map
+zcat singl.CAF01.gnm1.ann1.WFKC.gene_models_main.gff3.gz | \
+awk 'BEGIN{OFS="\t"}
+     FNR==NR{map[$1]=$2; next}
+     /^#/ {print; next}
+     {
+       if ($1 in map) {
+         $1=map[$1];
+         print
+       }
+     }' sindora_chr.map - \
+> /data/mshe/deepRloopPro_data/genome_file/Sindora_glabra_GCA_020226215.1/Sindora_glabra.GCA_020226215.1.chr12.NCBIseqid.gff3
+awk '$1 !~ /^#/ {print $1}' /data/mshe/deepRloopPro_data/genome_file/Sindora_glabra_GCA_020226215.1/Sindora_glabra.GCA_020226215.1.chr12.NCBIseqid.gff3 | sort -u
+
+
 #前面四种分类过于粗糙，重新细分TTS区、基因调控区（promoter ∪ gene_body ∪ TTS），gtf 转 bed
 vim build_annotation_beds_with_tts.sh
 #!/usr/bin/env bash
