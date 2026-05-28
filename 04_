@@ -1,0 +1,213 @@
+#需要将79个属做成进化树样式
+# window上建表格，另存为csv格式，用 Python 生成 Newick分类树，再用 R/ggtree 画图
+
+vim make_taxonomy_tree.py
+import csv
+
+input_csv = "genus_79_meta.csv"
+output_nwk = "legume_79genera_taxonomy.nwk"
+
+levels = ["Subfamily", "Major_clade", "Clade_2", "Genus"]
+
+def clean(x):
+    if x is None:
+        return ""
+    x = str(x).strip()
+    if x.lower() in ["nan", "none"]:
+        return ""
+    x = x.replace(" ", "_")
+    x = x.replace("/", "_")
+    x = x.replace("+", "_plus_")
+    x = x.replace("(", "").replace(")", "")
+    x = x.replace(",", "")
+    return x
+
+tree = {}
+
+def add_path(root, path):
+    node = root
+    for item in path:
+        if item == "":
+            continue
+        node = node.setdefault(item, {})
+
+with open(input_csv, newline="", encoding="utf-8-sig") as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        path = ["Fabaceae"] + [clean(row.get(col, "")) for col in levels]
+        add_path(tree, path)
+
+def to_newick(node, name=""):
+    if not node:
+        return name
+    children = [to_newick(child_node, child_name) for child_name, child_node in node.items()]
+    if name:
+        return "(" + ",".join(children) + ")" + name
+    return "(" + ",".join(children) + ")"
+
+nwk = to_newick(tree) + ";"
+
+with open(output_nwk, "w", encoding="utf-8") as f:
+    f.write(nwk)
+
+print(f"Saved: {output_nwk}")
+python make_taxonomy_tree.py
+
+
+conda create -n legume_tree -c conda-forge -c bioconda \
+  r-base r-ape r-tidyverse bioconductor-ggtree bioconductor-treeio
+
+conda activate legume_tree
+vim plot_tree.R
+library(ape)
+library(ggtree)
+library(tidyverse)
+
+# =========================
+# 1. 读取数据
+# =========================
+
+tree <- read.tree("legume_79genera_taxonomy.nwk")
+meta <- read.csv("genus_79_meta.csv", stringsAsFactors = FALSE, fileEncoding = "UTF-8-BOM")
+
+# 删除可能存在的 label 列，避免和 ggtree 自带 label 冲突
+if ("label" %in% colnames(meta)) {
+  meta <- meta[, colnames(meta) != "label"]
+}
+
+meta <- meta %>%
+  mutate(across(everything(), ~ trimws(as.character(.x))))
+
+# 用于匹配 Newick 里被清理过的节点名
+clean_label <- function(x) {
+  x <- trimws(as.character(x))
+  x <- gsub(" ", "_", x)
+  x <- gsub("/", "_", x)
+  x <- gsub("\\+", "_plus_", x)
+  x <- gsub("\\(", "", x)
+  x <- gsub("\\)", "", x)
+  x <- gsub(",", "", x)
+  x
+}
+
+meta <- meta %>%
+  mutate(
+    Subfamily_clean = clean_label(Subfamily),
+    Major_clade_clean = clean_label(Major_clade)
+  )
+
+# 检查树里的内部节点标签
+print("Internal node labels in tree:")
+print(tree$node.label)
+
+
+# =========================
+# 2. 基础树
+# =========================
+
+p0 <- ggtree(tree, layout = "rectangular", branch.length = "none", size = 0.5) %<+% meta +
+  geom_tippoint(
+    aes(shape = Selected_species, color = Subfamily),
+    size = 2.5
+  ) +
+  geom_tiplab(
+    aes(label = label),
+    align = TRUE,
+    offset = 0.35,
+    size = 3.2,
+    linesize = 0.25,
+    color = "black"
+  ) +
+  theme_tree() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9),
+    plot.margin = margin(5, 20, 5, 45)
+  )
+
+
+# =========================
+# 3. 准备 Subfamily 和 Major_clade 标签
+# =========================
+
+subfamily_map <- meta %>%
+  distinct(Subfamily_clean, Subfamily) %>%
+  filter(Subfamily_clean != "") %>%
+  transmute(
+    node_label = Subfamily_clean,
+    display_label = Subfamily,
+    label_type = "Subfamily"
+  )
+
+# Major_clade 如果全标会很挤；这里默认只标包含 >= 2 个属的 Major_clade
+major_map <- meta %>%
+  filter(Major_clade_clean != "") %>%
+  count(Major_clade_clean, Major_clade, name = "n_tips") %>%
+  filter(n_tips >= 1) %>%
+  transmute(
+    node_label = Major_clade_clean,
+    display_label = Major_clade,
+    label_type = "Major_clade"
+  )
+
+label_map <- bind_rows(subfamily_map, major_map) %>%
+  distinct(node_label, label_type, .keep_all = TRUE)
+
+# 从 ggtree 的节点坐标里提取对应内部节点
+node_ann <- p0$data %>%
+  filter(!isTip, !is.na(label), label != "") %>%
+  inner_join(label_map, by = c("label" = "node_label")) %>%
+  mutate(
+    display_label = gsub("_", " ", display_label),
+    x_seg_start = ifelse(label_type == "Subfamily", x - 0.75, x - 0.45),
+    x_seg_end   = x,
+    x_text      = ifelse(label_type == "Subfamily", x - 0.85, x - 0.55)
+  )
+
+print("Labels that will be plotted:")
+print(node_ann[, c("label_type", "display_label", "node", "x", "y")])
+
+write.csv(node_ann, "node_labels_used.csv", row.names = FALSE)
+
+
+# =========================
+# 4. 只画标签，不画注释线
+# =========================
+
+subfamily_ann <- node_ann %>% filter(label_type == "Subfamily")
+major_ann <- node_ann %>% filter(label_type == "Major_clade")
+
+max_x <- max(p0$data$x, na.rm = TRUE)
+
+p1 <- p0 +
+  geom_label(
+    data = subfamily_ann,
+    aes(x = x - 0.18, y = y, label = display_label),
+    inherit.aes = FALSE,
+    hjust = 1,
+    fontface = "bold",
+    size = 4.2,
+    label.size = NA,
+    fill = "white"
+  ) +
+  geom_label(
+    data = major_ann,
+    aes(x = x - 0.06, y = y, label = display_label),
+    inherit.aes = FALSE,
+    hjust = 1,
+    fontface = "italic",
+    size = 3.2,
+    label.size = NA,
+    fill = "white"
+  ) +
+  coord_cartesian(xlim = c(-3.2, max_x + 1.6), clip = "off")
+
+
+# =========================
+# 5. 保存
+# =========================
+
+ggsave("legume_79genera_tree_node_labels_v2.pdf", p1, width = 10, height = 18)
+ggsave("legume_79genera_tree_node_labels_v2.png", p1, width = 10, height = 18, dpi = 400)
+Rscript plot_tree.R
