@@ -211,3 +211,4 @@ p1 <- p0 +
 ggsave("legume_79genera_tree_node_labels_v2.pdf", p1, width = 10, height = 18)
 ggsave("legume_79genera_tree_node_labels_v2.png", p1, width = 10, height = 18, dpi = 400)
 Rscript plot_tree.R
+
