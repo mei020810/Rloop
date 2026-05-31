@@ -212,3 +212,175 @@ ggsave("legume_79genera_tree_node_labels_v2.pdf", p1, width = 10, height = 18)
 ggsave("legume_79genera_tree_node_labels_v2.png", p1, width = 10, height = 18, dpi = 400)
 Rscript plot_tree.R
 
+
+## 收集倍性信息时发现 vicia 物种的染色体数是6，但 ncbi 的是7，查阅得知 ncbi 将第一条染色体分成了两条，故有7条，因此需要针对 vicia 更改summary表的平均每条染色体区域数的计算方法
+vim make_rloop_summary.sh
+
+#!/usr/bin/env bash
+RUNLIST="/data/mshe/deepRloopPro_data/new_list_A.tsv"
+RESULT_DIR="deepRloop_results_A"
+OUT="rloop_summary_new.tsv"
+printf "物种\t组装染色体数\t生物学染色体数\t主染色体总长度\tRloop区域数\t总覆盖长度\t平均区域长度\t每100Mb区域数\tRloop覆盖比例\t平均每个assembly_component区域数\t平均每条生物学染色体区域数\t每条生物学染色体区域数\n" > "$OUT"
+
+# 从 run_list_A.tsv 读取 prefix -> chromsize 路径
+declare -A CHRMAP
+
+while IFS=$'\t' read -r PREFIX FASTA CHROMSIZE FAI
+do
+    [ -z "$PREFIX" ] && continue
+    CHRMAP["$PREFIX"]="$CHROMSIZE"
+done < "$RUNLIST"
+
+for bed in $(ls "$RESULT_DIR"/*_final_predict.bed 2>/dev/null | sort)
+do
+    [ -e "$bed" ] || continue
+
+    prefix=$(basename "$bed" _final_predict.bed)
+    chromsize="${CHRMAP[$prefix]:-}"
+
+    if [ -z "$chromsize" ]; then
+        echo "[WARN] $prefix 不在 $RUNLIST 里，chromsize 设为 NA" >&2
+    elif [ ! -f "$chromsize" ]; then
+        echo "[WARN] $prefix 的 chromsize 文件不存在: $chromsize" >&2
+    fi
+
+    # 组装染色体数 和 主染色体总长度
+    if [ -n "$chromsize" ] && [ -f "$chromsize" ]; then
+        assembly_chr_n=$(wc -l < "$chromsize")
+        chr_total_len=$(awk '{sum += $2} END{print sum+0}' "$chromsize")
+    else
+        assembly_chr_n="NA"
+        chr_total_len="NA"
+    fi
+
+    # 生物学染色体数
+    # 默认情况下，生物学单倍体染色体数 n = 组装染色体数
+    bio_chr_n="$assembly_chr_n"
+
+    # Vicia faba 特殊处理：
+    # Hedin2 assembly 中 Chr1 被拆成 1S 和 1L 两个 assembly components，但生物学上 Vicia faba 是 2n=12，所以单倍体生物学染色体数 n=6。
+    if [[ "$prefix" == Vicia_faba* ]]; then
+        bio_chr_n=6
+    fi
+
+    # R-loop 区域数
+    region_n=$(awk 'NF >= 3 {n++} END{print n+0}' "$bed")
+
+    # 总覆盖长度 和 平均区域长度
+    read total_len mean_len <<EOF
+$(awk '
+NF >= 3 {
+    len = $3 - $2
+    if (len > 0) {
+        sum += len
+        n++
+    }
+}
+END {
+    if (n > 0) printf "%d %.2f\n", sum, sum/n
+    else print "0 0"
+}' "$bed")
+EOF
+
+    # 每100Mb区域数、覆盖比例、平均每个 assembly component 区域数、平均每条生物学染色体区域数
+    if [ "$chr_total_len" != "NA" ] && [ "$assembly_chr_n" != "NA" ] && [ "$bio_chr_n" != "NA" ] && \
+       [ "$chr_total_len" -gt 0 ] && [ "$assembly_chr_n" -gt 0 ] && [ "$bio_chr_n" -gt 0 ]; then
+
+        per100mb=$(awk -v r="$region_n" -v l="$chr_total_len" 'BEGIN{printf "%.2f", r/l*100000000}')
+        coverage_ratio=$(awk -v t="$total_len" -v l="$chr_total_len" 'BEGIN{printf "%.6f", t/l}')
+        per_assembly_chr=$(awk -v r="$region_n" -v n="$assembly_chr_n" 'BEGIN{printf "%.2f", r/n}')
+        per_bio_chr=$(awk -v r="$region_n" -v n="$bio_chr_n" 'BEGIN{printf "%.2f", r/n}')
+
+        # 每条生物学染色体区域数
+        # 对 Vicia_faba，把 Chr1S 和 Chr1L 合并为 Chr1；
+        # 其他物种保持 chromsize 中的 chromosome/component 名称。
+        bio_chr_counts=$(awk -v prefix="$prefix" '
+        function norm_chr(c) {
+            if (prefix ~ /^Vicia_faba/) {
+                if (c ~ /(^|[^0-9A-Za-z])1S$/ || c ~ /[Cc]hr[^0-9A-Za-z]*1S$/ || c ~ /[Cc]hromosome[^0-9A-Za-z]*1S$/) return "Chr1"
+                if (c ~ /(^|[^0-9A-Za-z])1L$/ || c ~ /[Cc]hr[^0-9A-Za-z]*1L$/ || c ~ /[Cc]hromosome[^0-9A-Za-z]*1L$/) return "Chr1"
+            }
+            return c
+        }
+
+        NR == FNR {
+            c = norm_chr($1)
+            if (!(c in seen)) {
+                seen[c] = 1
+                order[++n] = c
+                count[c] = 0
+            }
+            next
+        }
+
+        NF >= 3 {
+            c = norm_chr($1)
+            count[c]++
+            if (!(c in seen)) {
+                seen[c] = 1
+                order[++n] = c
+            }
+        }
+
+        END {
+            for (i = 1; i <= n; i++) {
+                c = order[i]
+                printf "%s:%d", c, count[c]+0
+                if (i < n) printf ";"
+            }
+            printf "\n"
+        }' "$chromsize" "$bed")
+
+    else
+        per100mb="NA"
+        coverage_ratio="NA"
+        per_assembly_chr="NA"
+        per_bio_chr="NA"
+
+        # 没有 chromsize 时，只能根据 bed 里出现过的 chromosome/component 统计
+        bio_chr_counts=$(awk -v prefix="$prefix" '
+        function norm_chr(c) {
+            if (prefix ~ /^Vicia_faba/) {
+                if (c ~ /(^|[^0-9A-Za-z])1S$/ || c ~ /[Cc]hr[^0-9A-Za-z]*1S$/ || c ~ /[Cc]hromosome[^0-9A-Za-z]*1S$/) return "Chr1"
+                if (c ~ /(^|[^0-9A-Za-z])1L$/ || c ~ /[Cc]hr[^0-9A-Za-z]*1L$/ || c ~ /[Cc]hromosome[^0-9A-Za-z]*1L$/) return "Chr1"
+            }
+            return c
+        }
+
+        NF >= 3 {
+            c = norm_chr($1)
+            count[c]++
+        }
+
+        END {
+            first = 1
+            for (c in count) {
+                if (!first) printf ";"
+                printf "%s:%d", c, count[c]
+                first = 0
+            }
+            printf "\n"
+        }' "$bed")
+    fi
+
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$prefix" \
+        "$assembly_chr_n" \
+        "$bio_chr_n" \
+        "$chr_total_len" \
+        "$region_n" \
+        "$total_len" \
+        "$mean_len" \
+        "$per100mb" \
+        "$coverage_ratio" \
+        "$per_assembly_chr" \
+        "$per_bio_chr" \
+        "$bio_chr_counts" >> "$OUT"
+done
+
+echo "已生成: $OUT"
+column -t -s $'\t' "$OUT" | less -S
+
+chmod +x make_rloop_summary.sh
+bash make_rloop_summary.sh
+
