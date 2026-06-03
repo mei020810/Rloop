@@ -384,3 +384,1546 @@ column -t -s $'\t' "$OUT" | less -S
 chmod +x make_rloop_summary.sh
 bash make_rloop_summary.sh
 
+#将分支映射到表格上
+awk -F'\t' -v OFS='\t' '
+NR == FNR {
+    if (FNR > 1) map[$1] = $2 OFS $3
+    next
+}
+
+FNR == 1 {
+    rest = substr($0, index($0, FS) + 1)
+    print $1, "亚科", "主要分支", rest
+    next
+}
+
+{
+    rest = substr($0, index($0, FS) + 1)
+    if ($1 in map) {
+        print $1, map[$1], rest
+    } else {
+        print $1, "NA", "NA", rest
+    }
+}
+' species_branch_map_20.clean.tsv rloop_summary_new.tsv | {
+    IFS= read -r header
+    printf '%s\n' "$header"
+    sort -t $'\t' -k2,2 -k3,3 -k1,1
+} > rloop_summary_new_with_branch_sorted.tsv
+column -t -s $'\t' rloop_summary_new_with_branch_sorted.tsv | less -S
+
+# genedata的表格也要改
+cat > make_genedata_rloop_summary.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+RUNLIST="new_list_A.tsv"
+ANNOTATION_LIST="annotation_list_new.tsv"
+BRANCH_MAP="species_branch_map_20.clean.tsv"
+BED_DIR="deepRloop_results_A"
+OUT="genedata_rloop_summary.tsv"
+
+# 是否计算主染色体 GC content
+# 0 = 不计算，输出 NA，速度快
+# 1 = 计算，需要读取 fasta，大基因组会比较慢
+CALC_GC="${CALC_GC:-0}"
+
+printf "species\tsubfamily\tmajor_branch\tassembly_size_bp\tassembly_main_chr_n\tbiological_main_chr_n\tbiological_main_chr_size_bp\tgene_number_biological_main_chr\tgene_number_source\tgene_density_per_Mb\tGC_content_main_chr\tRloop_region_number\tRloop_total_bp\tRloop_merged_total_bp\tRloop_mean_length\tRloop_density_per_100Mb\tRloop_coverage_ratio\tRloop_merged_coverage_ratio\tRloop_per_biological_chr_mean\tRloop_per_biological_chr_counts\n" > "$OUT"
+
+declare -A FASTAMAP
+declare -A CHRMAP
+declare -A FAIMAP
+declare -A ANNOMAP
+declare -A ANNO_CHRMAP
+declare -A SUBFAMILY
+declare -A BRANCH
+
+# 读取 new_list_A.tsv
+# 格式：
+# prefix    fasta    chromsize    fai
+while IFS=$'\t' read -r PREFIX FASTA CHROMSIZE FAI REST
+do
+    [[ -z "${PREFIX:-}" ]] && continue
+    [[ "$PREFIX" == "prefix" || "$PREFIX" == "species" || "$PREFIX" == "物种" ]] && continue
+
+    FASTAMAP["$PREFIX"]="$FASTA"
+    CHRMAP["$PREFIX"]="$CHROMSIZE"
+    FAIMAP["$PREFIX"]="$FAI"
+done < "$RUNLIST"
+
+# 读取 annotation_list_new.tsv
+# 格式：
+# prefix    annotation.gtf/gff/gff3    chromsize
+while IFS=$'\t' read -r PREFIX ANNO CHROMSIZE REST
+do
+    [[ -z "${PREFIX:-}" ]] && continue
+    [[ "$PREFIX" == "prefix" || "$PREFIX" == "species" || "$PREFIX" == "物种" ]] && continue
+
+    ANNOMAP["$PREFIX"]="$ANNO"
+    ANNO_CHRMAP["$PREFIX"]="$CHROMSIZE"
+done < "$ANNOTATION_LIST"
+
+# 读取分支信息
+# 格式：
+# species    subfamily    major_branch
+if [[ -f "$BRANCH_MAP" ]]; then
+    while IFS=$'\t' read -r PREFIX SF MB REST
+    do
+        [[ -z "${PREFIX:-}" ]] && continue
+        [[ "$PREFIX" == "species" || "$PREFIX" == "物种" ]] && continue
+
+        SUBFAMILY["$PREFIX"]="$SF"
+        BRANCH["$PREFIX"]="$MB"
+    done < "$BRANCH_MAP"
+else
+    echo "[WARN] 找不到分支文件: $BRANCH_MAP，subfamily 和 major_branch 将输出 NA" >&2
+fi
+
+check_tab_columns() {
+    local file="$1"
+    local expected="$2"
+
+    if [[ ! -f "$file" ]]; then
+        echo "[ERROR] 找不到文件: $file" >&2
+        exit 1
+    fi
+
+    awk -F'\t' -v expected="$expected" -v file="$file" '
+    NF != expected {
+        printf "[BAD FORMAT] %s line %d: NF=%d, expected=%d\n%s\n", file, NR, NF, expected, $0 > "/dev/stderr"
+        bad = 1
+    }
+    END {
+        if (bad) exit 1
+    }
+    ' "$file"
+}
+
+check_tab_columns "$RUNLIST" 4
+check_tab_columns "$ANNOTATION_LIST" 3
+
+get_assembly_size_from_fai() {
+    local fai="$1"
+
+    if [[ ! -f "$fai" ]]; then
+        echo "NA"
+        return
+    fi
+
+    awk '{sum += $2} END{print sum+0}' "$fai"
+}
+
+get_biological_main_chr_n() {
+    local prefix="$1"
+    local chromsize="$2"
+
+    if [[ ! -f "$chromsize" ]]; then
+        echo "NA"
+        return
+    fi
+
+    if [[ "$prefix" == Vicia_faba* ]]; then
+        echo 6
+    else
+        wc -l < "$chromsize"
+    fi
+}
+
+get_main_chr_gc() {
+    local fasta="$1"
+    local chromsize="$2"
+
+    if [[ "$CALC_GC" != "1" ]]; then
+        echo "NA"
+        return
+    fi
+
+    if [[ ! -f "$fasta" || ! -f "$chromsize" ]]; then
+        echo "NA"
+        return
+    fi
+
+    awk '
+    NR == FNR {
+        keep[$1] = 1
+        next
+    }
+
+    /^>/ {
+        name = substr($0, 2)
+        split(name, header_field, /[ \t]/)
+        chr = header_field[1]
+        use = (chr in keep)
+        next
+    }
+
+    use {
+        seq = toupper($0)
+
+        g_count += gsub(/G/, "G", seq)
+        c_count += gsub(/C/, "C", seq)
+        a_count += gsub(/A/, "A", seq)
+        t_count += gsub(/T/, "T", seq)
+    }
+
+    END {
+        total = a_count + t_count + g_count + c_count
+        if (total > 0) {
+            printf "%.6f", (g_count + c_count) / total
+        } else {
+            print "NA"
+        }
+    }
+    ' "$chromsize" "$fasta"
+}
+
+get_gene_number_and_source_main_chr() {
+    local anno="$1"
+    local chromsize="$2"
+
+    if [[ ! -f "$anno" || ! -f "$chromsize" ]]; then
+        echo -e "NA\tNA"
+        return
+    fi
+
+    if [[ "$anno" == *.gz ]]; then
+        zcat "$anno" | awk -v chromsize="$chromsize" '
+        BEGIN {
+            OFS = "\t"
+            while ((getline line < chromsize) > 0) {
+                split(line, a, /[ \t]/)
+                keep[a[1]] = 1
+            }
+            close(chromsize)
+        }
+
+        function get_proxy_gene_id(attr, fallback, id, a, b) {
+            id = ""
+
+            if (match(attr, /Parent=([^;]+)/, a)) {
+                id = a[1]
+            } else if (match(attr, /gene_id "([^"]+)"/, a)) {
+                id = a[1]
+            } else if (match(attr, /ID=([^;]+)/, a)) {
+                id = a[1]
+            } else if (match(attr, /transcript_id "([^"]+)"/, a)) {
+                id = a[1]
+            } else {
+                id = fallback
+            }
+
+            split(id, b, ",")
+            id = b[1]
+
+            gsub(/^gene:/, "", id)
+            sub(/-t[0-9]+(_[^;]+)?$/, "", id)
+            sub(/\.t[0-9]+$/, "", id)
+            sub(/_mRNA[0-9]+$/, "", id)
+
+            return id
+        }
+
+        $0 ~ /^#/ { next }
+        !($1 in keep) { next }
+
+        $3 == "gene" {
+            gene_n++
+            next
+        }
+
+        $3 == "mRNA" {
+            fallback = $1 ":" $4 "-" $5 ":" $7
+            gid = get_proxy_gene_id($9, fallback)
+            mrna_gene[gid] = 1
+            next
+        }
+
+        $3 == "transcript" {
+            fallback = $1 ":" $4 "-" $5 ":" $7
+            gid = get_proxy_gene_id($9, fallback)
+            transcript_gene[gid] = 1
+            next
+        }
+
+        END {
+            if (gene_n > 0) {
+                print gene_n, "gene"
+            } else {
+                for (g in mrna_gene) mrna_n++
+                for (g in transcript_gene) transcript_n++
+
+                if (mrna_n > 0) {
+                    print mrna_n, "mRNA_proxy"
+                } else if (transcript_n > 0) {
+                    print transcript_n, "transcript_proxy"
+                } else {
+                    print 0, "unavailable"
+                }
+            }
+        }
+        '
+    else
+        awk '
+        BEGIN {
+            OFS = "\t"
+        }
+
+        NR == FNR {
+            keep[$1] = 1
+            next
+        }
+
+        function get_proxy_gene_id(attr, fallback, id, a, b) {
+            id = ""
+
+            if (match(attr, /Parent=([^;]+)/, a)) {
+                id = a[1]
+            } else if (match(attr, /gene_id "([^"]+)"/, a)) {
+                id = a[1]
+            } else if (match(attr, /ID=([^;]+)/, a)) {
+                id = a[1]
+            } else if (match(attr, /transcript_id "([^"]+)"/, a)) {
+                id = a[1]
+            } else {
+                id = fallback
+            }
+
+            split(id, b, ",")
+            id = b[1]
+
+            gsub(/^gene:/, "", id)
+            sub(/-t[0-9]+(_[^;]+)?$/, "", id)
+            sub(/\.t[0-9]+$/, "", id)
+            sub(/_mRNA[0-9]+$/, "", id)
+
+            return id
+        }
+
+        $0 ~ /^#/ { next }
+        !($1 in keep) { next }
+
+        $3 == "gene" {
+            gene_n++
+            next
+        }
+
+        $3 == "mRNA" {
+            fallback = $1 ":" $4 "-" $5 ":" $7
+            gid = get_proxy_gene_id($9, fallback)
+            mrna_gene[gid] = 1
+            next
+        }
+
+        $3 == "transcript" {
+            fallback = $1 ":" $4 "-" $5 ":" $7
+            gid = get_proxy_gene_id($9, fallback)
+            transcript_gene[gid] = 1
+            next
+        }
+
+        END {
+            if (gene_n > 0) {
+                print gene_n, "gene"
+            } else {
+                for (g in mrna_gene) mrna_n++
+                for (g in transcript_gene) transcript_n++
+
+                if (mrna_n > 0) {
+                    print mrna_n, "mRNA_proxy"
+                } else if (transcript_n > 0) {
+                    print transcript_n, "transcript_proxy"
+                } else {
+                    print 0, "unavailable"
+                }
+            }
+        }
+        ' "$chromsize" "$anno"
+    fi
+}
+
+get_rloop_total_and_mean() {
+    local bed="$1"
+
+    awk '
+    NF >= 3 {
+        len = $3 - $2
+        if (len > 0) {
+            sum += len
+            n++
+        }
+    }
+    END {
+        if (n > 0) {
+            printf "%d %.2f\n", sum, sum/n
+        } else {
+            print "0 0"
+        }
+    }
+    ' "$bed"
+}
+
+get_rloop_merged_total() {
+    local bed="$1"
+
+    if command -v bedtools >/dev/null 2>&1; then
+        bedtools sort -i "$bed" \
+        | bedtools merge -i - \
+        | awk '{sum += $3 - $2} END{print sum+0}'
+    else
+        sort -k1,1 -k2,2n "$bed" \
+        | awk '
+        BEGIN {
+            chr = ""
+            start = -1
+            end = -1
+            sum = 0
+        }
+
+        NF >= 3 {
+            c = $1
+            s = $2
+            e = $3
+
+            if (chr == "") {
+                chr = c
+                start = s
+                end = e
+                next
+            }
+
+            if (c == chr && s <= end) {
+                if (e > end) end = e
+            } else {
+                sum += end - start
+                chr = c
+                start = s
+                end = e
+            }
+        }
+
+        END {
+            if (chr != "") sum += end - start
+            print sum+0
+        }
+        '
+    fi
+}
+
+get_rloop_per_biological_chr_counts() {
+    local prefix="$1"
+    local chromsize="$2"
+    local bed="$3"
+
+    if [[ -f "$chromsize" ]]; then
+        awk -v prefix="$prefix" '
+        function norm_chr(c) {
+            if (prefix ~ /^Vicia_faba/) {
+                if (c ~ /(^|[^0-9A-Za-z])1S$/ || c ~ /[Cc]hr[^0-9A-Za-z]*1S$/ || c ~ /[Cc]hromosome[^0-9A-Za-z]*1S$/) return "Chr1"
+                if (c ~ /(^|[^0-9A-Za-z])1L$/ || c ~ /[Cc]hr[^0-9A-Za-z]*1L$/ || c ~ /[Cc]hromosome[^0-9A-Za-z]*1L$/) return "Chr1"
+            }
+            return c
+        }
+
+        NR == FNR {
+            c = norm_chr($1)
+            if (!(c in seen)) {
+                seen[c] = 1
+                order[++n] = c
+                count[c] = 0
+            }
+            next
+        }
+
+        NF >= 3 {
+            c = norm_chr($1)
+            count[c]++
+            if (!(c in seen)) {
+                seen[c] = 1
+                order[++n] = c
+            }
+        }
+
+        END {
+            for (i = 1; i <= n; i++) {
+                c = order[i]
+                printf "%s:%d", c, count[c]+0
+                if (i < n) printf ";"
+            }
+            printf "\n"
+        }
+        ' "$chromsize" "$bed"
+    else
+        awk -v prefix="$prefix" '
+        function norm_chr(c) {
+            if (prefix ~ /^Vicia_faba/) {
+                if (c ~ /(^|[^0-9A-Za-z])1S$/ || c ~ /[Cc]hr[^0-9A-Za-z]*1S$/ || c ~ /[Cc]hromosome[^0-9A-Za-z]*1S$/) return "Chr1"
+                if (c ~ /(^|[^0-9A-Za-z])1L$/ || c ~ /[Cc]hr[^0-9A-Za-z]*1L$/ || c ~ /[Cc]hromosome[^0-9A-Za-z]*1L$/) return "Chr1"
+            }
+            return c
+        }
+
+        NF >= 3 {
+            c = norm_chr($1)
+            count[c]++
+        }
+
+        END {
+            first = 1
+            for (c in count) {
+                if (!first) printf ";"
+                printf "%s:%d", c, count[c]
+                first = 0
+            }
+            printf "\n"
+        }
+        ' "$bed"
+    fi
+}
+
+for bed in $(ls "${BED_DIR}"/*_final_predict.bed 2>/dev/null | sort)
+do
+    [[ -e "$bed" ]] || continue
+
+    prefix=$(basename "$bed" _final_predict.bed)
+
+    fasta="${FASTAMAP[$prefix]:-NA}"
+    chromsize="${CHRMAP[$prefix]:-NA}"
+    fai="${FAIMAP[$prefix]:-NA}"
+    anno="${ANNOMAP[$prefix]:-NA}"
+
+    subfamily="${SUBFAMILY[$prefix]:-NA}"
+    major_branch="${BRANCH[$prefix]:-NA}"
+
+    if [[ "$chromsize" == "NA" || ! -f "$chromsize" ]]; then
+        echo "[WARN] $prefix 的 chromsize 不存在: $chromsize" >&2
+    fi
+
+    if [[ "$fai" == "NA" || ! -f "$fai" ]]; then
+        echo "[WARN] $prefix 的 fai 不存在: $fai" >&2
+    fi
+
+    if [[ "$anno" == "NA" || ! -f "$anno" ]]; then
+        echo "[WARN] $prefix 的 annotation 不存在: $anno" >&2
+    fi
+
+    # 如果 annotation_list 和 new_list_A 里的 chromsize 不一致，给警告
+    anno_chrom="${ANNO_CHRMAP[$prefix]:-NA}"
+    if [[ "$anno_chrom" != "NA" && "$chromsize" != "NA" && "$anno_chrom" != "$chromsize" ]]; then
+        echo "[WARN] $prefix chromsize 不一致:" >&2
+        echo "       new_list_A:        $chromsize" >&2
+        echo "       annotation_list:   $anno_chrom" >&2
+    fi
+
+    # assembly size 直接由 fai 计算
+    if [[ "$fai" != "NA" && -f "$fai" ]]; then
+        assembly_size=$(get_assembly_size_from_fai "$fai")
+    else
+        assembly_size="NA"
+    fi
+
+    # 组装主染色体数、主染色体总长度、生物学染色体数
+    if [[ "$chromsize" != "NA" && -f "$chromsize" ]]; then
+        assembly_main_chr_n=$(wc -l < "$chromsize")
+        biological_main_chr_size=$(awk '{sum += $2} END{print sum+0}' "$chromsize")
+        biological_main_chr_n=$(get_biological_main_chr_n "$prefix" "$chromsize")
+    else
+        assembly_main_chr_n="NA"
+        biological_main_chr_size="NA"
+        biological_main_chr_n="NA"
+    fi
+
+    # gene number on biological main chromosomes
+    # Vicia_faba 的 Chr1S + Chr1L 都保留在 chromsize 中，所以 gene 总数不需要额外合并；
+    # 合并只影响每条染色体 counts 和 per-chr mean 的分母。
+    if [[ "$anno" != "NA" && -f "$anno" && "$chromsize" != "NA" && -f "$chromsize" ]]; then
+        read -r gene_number gene_number_source < <(get_gene_number_and_source_main_chr "$anno" "$chromsize")
+    else
+        gene_number="NA"
+        gene_number_source="NA"
+    fi
+
+    # gene density
+    if [[ "$gene_number" != "NA" && "$biological_main_chr_size" != "NA" && "$biological_main_chr_size" -gt 0 ]]; then
+        gene_density=$(awk -v g="$gene_number" -v s="$biological_main_chr_size" 'BEGIN{printf "%.4f", g/(s/1000000)}')
+    else
+        gene_density="NA"
+    fi
+
+    # GC content，可选
+    if [[ "$fasta" != "NA" && -f "$fasta" && "$chromsize" != "NA" && -f "$chromsize" ]]; then
+        gc_content=$(get_main_chr_gc "$fasta" "$chromsize")
+    else
+        gc_content="NA"
+    fi
+
+    # R-loop 区域数
+    rloop_n=$(awk 'NF >= 3 {n++} END{print n+0}' "$bed")
+
+    # R-loop 原始总长度和平均长度
+    read -r rloop_total_bp rloop_mean_len < <(get_rloop_total_and_mean "$bed")
+
+    # R-loop merge 后非冗余覆盖长度
+    rloop_merged_total_bp=$(get_rloop_merged_total "$bed")
+
+    # R-loop density / coverage / biological chromosome mean
+    if [[ "$biological_main_chr_size" != "NA" && "$biological_main_chr_n" != "NA" && "$biological_main_chr_size" -gt 0 && "$biological_main_chr_n" -gt 0 ]]; then
+        rloop_density=$(awk -v r="$rloop_n" -v l="$biological_main_chr_size" 'BEGIN{printf "%.2f", r/l*100000000}')
+        rloop_coverage=$(awk -v t="$rloop_total_bp" -v l="$biological_main_chr_size" 'BEGIN{printf "%.6f", t/l}')
+        rloop_merged_coverage=$(awk -v t="$rloop_merged_total_bp" -v l="$biological_main_chr_size" 'BEGIN{printf "%.6f", t/l}')
+        rloop_per_biological_chr_mean=$(awk -v r="$rloop_n" -v n="$biological_main_chr_n" 'BEGIN{printf "%.2f", r/n}')
+        rloop_per_biological_chr_counts=$(get_rloop_per_biological_chr_counts "$prefix" "$chromsize" "$bed")
+    else
+        rloop_density="NA"
+        rloop_coverage="NA"
+        rloop_merged_coverage="NA"
+        rloop_per_biological_chr_mean="NA"
+        rloop_per_biological_chr_counts=$(get_rloop_per_biological_chr_counts "$prefix" "$chromsize" "$bed")
+    fi
+
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$prefix" \
+        "$subfamily" \
+        "$major_branch" \
+        "$assembly_size" \
+        "$assembly_main_chr_n" \
+        "$biological_main_chr_n" \
+        "$biological_main_chr_size" \
+        "$gene_number" \
+        "$gene_number_source" \
+        "$gene_density" \
+        "$gc_content" \
+        "$rloop_n" \
+        "$rloop_total_bp" \
+        "$rloop_merged_total_bp" \
+        "$rloop_mean_len" \
+        "$rloop_density" \
+        "$rloop_coverage" \
+        "$rloop_merged_coverage" \
+        "$rloop_per_biological_chr_mean" \
+        "$rloop_per_biological_chr_counts" >> "$OUT"
+done
+
+echo "已生成: $OUT"
+echo
+column -t -s $'\t' "$OUT" | less -S
+EOF
+
+CALC_GC=1 bash make_genedata_rloop_summary.sh
+
+#重新生成一组图（vicia的平均染色体区域数变了）
+vim plot_rloop_summary_merged_coverage.R
+#!/usr/bin/env Rscript
+
+# 用法:
+# Rscript plot_rloop_summary_merged_coverage.R genedata_rloop_summary.tsv summary_plots_merged
+#
+# 第1个参数: 输入TSV
+# 第2个参数: 输出目录
+
+args <- commandArgs(trailingOnly = TRUE)
+input_file <- if (length(args) >= 1) args[1] else "genedata_rloop_summary.tsv"
+outdir     <- if (length(args) >= 2) args[2] else "summary_plots_merged"
+
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+need_pkgs <- c("readr", "dplyr", "ggplot2", "forcats", "stringr")
+for (pkg in need_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop(sprintf("缺少R包: %s\n请先安装: install.packages('%s')", pkg, pkg))
+  }
+}
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(stringr)
+
+# ----------------------------
+# 读取数据
+# ----------------------------
+df0 <- read_tsv(
+  input_file,
+  show_col_types = FALSE,
+  locale = locale(encoding = "UTF-8")
+)
+
+required_cols <- c(
+  "species",
+  "subfamily",
+  "major_branch",
+  "assembly_size_bp",
+  "assembly_main_chr_n",
+  "biological_main_chr_n",
+  "biological_main_chr_size_bp",
+  "gene_number_biological_main_chr",
+  "gene_number_source",
+  "gene_density_per_Mb",
+  "GC_content_main_chr",
+  "Rloop_region_number",
+  "Rloop_total_bp",
+  "Rloop_merged_total_bp",
+  "Rloop_mean_length",
+  "Rloop_density_per_100Mb",
+  "Rloop_coverage_ratio",
+  "Rloop_merged_coverage_ratio",
+  "Rloop_per_biological_chr_mean",
+  "Rloop_per_biological_chr_counts"
+)
+
+missing_cols <- setdiff(required_cols, colnames(df0))
+if (length(missing_cols) > 0) {
+  stop("缺少必要列: ", paste(missing_cols, collapse = ", "))
+}
+
+num_cols <- c(
+  "assembly_size_bp",
+  "assembly_main_chr_n",
+  "biological_main_chr_n",
+  "biological_main_chr_size_bp",
+  "gene_number_biological_main_chr",
+  "gene_density_per_Mb",
+  "GC_content_main_chr",
+  "Rloop_region_number",
+  "Rloop_total_bp",
+  "Rloop_merged_total_bp",
+  "Rloop_mean_length",
+  "Rloop_density_per_100Mb",
+  "Rloop_coverage_ratio",
+  "Rloop_merged_coverage_ratio",
+  "Rloop_per_biological_chr_mean"
+)
+
+df0 <- df0 %>%
+  mutate(across(all_of(num_cols), ~ suppressWarnings(as.numeric(.x))))
+
+# 物种简写：去掉 accession，保留属种名
+make_species_label <- function(x) {
+  m <- stringr::str_match(x, "^([^_]+)_([^_]+)")
+  ifelse(
+    !is.na(m[, 1]),
+    paste(m[, 2], m[, 3], sep = " "),
+    x
+  )
+}
+
+branch_order <- c(
+  "Cercidoideae | basal_non_papilionoid",
+  "Detarioideae | basal_non_papilionoid",
+  "Dialioideae | basal_non_papilionoid",
+  "Caesalpinioideae | Cassieae",
+  "Caesalpinioideae | Mimoseae",
+  "Papilionoideae | dalbergioid",
+  "Papilionoideae | genistoid",
+  "Papilionoideae | IRLC",
+  "Papilionoideae | millettioid_phaseoloid"
+)
+
+df <- df0 %>%
+  transmute(
+    物种 = species,
+    亚科 = subfamily,
+    主要分支 = major_branch,
+
+    组装总长度 = assembly_size_bp,
+    组装主染色体数 = assembly_main_chr_n,
+    生物学主染色体数 = biological_main_chr_n,
+    生物学主染色体总长度 = biological_main_chr_size_bp,
+
+    主染色体基因数 = gene_number_biological_main_chr,
+    基因数来源 = gene_number_source,
+    基因密度_per_Mb = gene_density_per_Mb,
+    GC含量 = GC_content_main_chr,
+
+    Rloop区域数 = Rloop_region_number,
+    Rloop原始总长度 = Rloop_total_bp,
+    Rloop合并总长度 = Rloop_merged_total_bp,
+    平均区域长度 = Rloop_mean_length,
+    每100Mb区域数 = Rloop_density_per_100Mb,
+
+    # 原始覆盖比例：未 merge 的总长度 / 主染色体总长度
+    Rloop原始覆盖比例 = Rloop_coverage_ratio,
+
+    # 推荐用于展示的覆盖比例：merge 后非冗余覆盖比例
+    Rloop覆盖比例 = Rloop_merged_coverage_ratio,
+
+    平均每条生物学染色体区域数 = Rloop_per_biological_chr_mean,
+    每条生物学染色体区域数 = Rloop_per_biological_chr_counts
+  ) %>%
+  mutate(
+    物种简称 = make_species_label(物种),
+    分支分组 = paste(亚科, 主要分支, sep = " | "),
+    分支分组 = factor(分支分组, levels = branch_order),
+    Rloop覆盖百分比 = Rloop覆盖比例 * 100,
+    组装总长度_Gb = 组装总长度 / 1e9,
+    生物学主染色体总长度_Gb = 生物学主染色体总长度 / 1e9
+  )
+
+write_tsv(df, file.path(outdir, "rloop_summary_cleaned.tsv"))
+
+# ----------------------------
+# 主题设置
+# ----------------------------
+theme_set(
+  theme_bw(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+      plot.title = element_text(face = "bold"),
+      legend.title = element_text(face = "bold")
+    )
+)
+
+save_plot <- function(p, filename, width = 10, height = 6) {
+  filepath <- file.path(outdir, filename)
+  if (grepl("\\.pdf$", filename, ignore.case = TRUE)) {
+    ggsave(
+      filename = filepath,
+      plot = p,
+      width = width,
+      height = height,
+      device = grDevices::cairo_pdf
+    )
+  } else {
+    ggsave(
+      filename = filepath,
+      plot = p,
+      width = width,
+      height = height,
+      dpi = 300
+    )
+  }
+}
+
+# ----------------------------
+# 1. 物种级：R-loop覆盖比例排序条形图
+# ----------------------------
+df_cov <- df %>%
+  arrange(Rloop覆盖比例) %>%
+  mutate(物种简称 = factor(物种简称, levels = 物种简称))
+
+p1 <- ggplot(df_cov, aes(x = 物种简称, y = Rloop覆盖比例, fill = 分支分组)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "各物种R-loop覆盖比例",
+    x = "物种",
+    y = "R-loop覆盖比例"
+  )
+
+save_plot(p1, "01_species_cov_ratio_bar.png", width = 10, height = 9)
+save_plot(p1, "01_species_cov_ratio_bar.pdf", width = 10, height = 9)
+
+# ----------------------------
+# 2. 物种级：每100Mb区域数排序条形图
+# ----------------------------
+df_density <- df %>%
+  arrange(每100Mb区域数) %>%
+  mutate(物种简称 = factor(物种简称, levels = 物种简称))
+
+p2 <- ggplot(df_density, aes(x = 物种简称, y = 每100Mb区域数, fill = 分支分组)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "各物种每100Mb的R-loop区域数",
+    x = "物种",
+    y = "每100Mb区域数"
+  )
+
+save_plot(p2, "02_species_density_bar.png", width = 10, height = 9)
+save_plot(p2, "02_species_density_bar.pdf", width = 10, height = 9)
+
+# ----------------------------
+# 3. 物种级：平均区域长度排序条形图
+# ----------------------------
+df_len <- df %>%
+  arrange(平均区域长度) %>%
+  mutate(物种简称 = factor(物种简称, levels = 物种简称))
+
+p3 <- ggplot(df_len, aes(x = 物种简称, y = 平均区域长度, fill = 分支分组)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "各物种R-loop平均区域长度",
+    x = "物种",
+    y = "平均区域长度"
+  )
+
+save_plot(p3, "03_species_mean_length_bar.png", width = 10, height = 9)
+save_plot(p3, "03_species_mean_length_bar.pdf", width = 10, height = 9)
+
+# ----------------------------
+# 4. 物种级：平均每条生物学染色体R-loop区域数
+# ----------------------------
+df_biochr <- df %>%
+  arrange(平均每条生物学染色体区域数) %>%
+  mutate(物种简称 = factor(物种简称, levels = 物种简称))
+
+p4 <- ggplot(df_biochr, aes(x = 物种简称, y = 平均每条生物学染色体区域数, fill = 分支分组)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "各物种平均每条生物学染色体的R-loop区域数",
+    x = "物种",
+    y = "平均每条生物学染色体区域数"
+  )
+
+save_plot(p4, "04_species_rloop_per_biochr_bar.png", width = 10, height = 9)
+save_plot(p4, "04_species_rloop_per_biochr_bar.pdf", width = 10, height = 9)
+
+# ----------------------------
+# 5. 分支分组：覆盖比例箱线图
+# ----------------------------
+p5 <- ggplot(df, aes(x = 分支分组, y = Rloop覆盖比例, fill = 分支分组)) +
+  geom_boxplot(outlier.shape = 21, outlier.size = 2) +
+  geom_jitter(width = 0.15, alpha = 0.7, size = 2) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 18)) +
+  labs(
+    title = "不同亚科-分支的R-loop覆盖比例",
+    x = "亚科 | 主要分支",
+    y = "R-loop覆盖比例"
+  ) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1),
+    plot.margin = margin(t = 10, r = 10, b = 35, l = 35)
+  )
+
+save_plot(p5, "05_branch_cov_ratio_boxplot.png", width = 10, height = 6)
+save_plot(p5, "05_branch_cov_ratio_boxplot.pdf", width = 10, height = 6)
+
+# ----------------------------
+# 6. 分支分组：每100Mb区域数箱线图
+# ----------------------------
+p6 <- ggplot(df, aes(x = 分支分组, y = 每100Mb区域数, fill = 分支分组)) +
+  geom_boxplot(outlier.shape = 21, outlier.size = 2) +
+  geom_jitter(width = 0.15, alpha = 0.7, size = 2) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 18)) +
+  labs(
+    title = "不同亚科-分支的R-loop密度",
+    x = "亚科 | 主要分支",
+    y = "每100Mb区域数"
+  ) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1),
+    plot.margin = margin(t = 10, r = 10, b = 35, l = 35)
+  )
+
+save_plot(p6, "06_branch_density_boxplot.png", width = 10, height = 6)
+save_plot(p6, "06_branch_density_boxplot.pdf", width = 10, height = 6)
+
+# ----------------------------
+# 7. 分支分组：平均区域长度箱线图
+# ----------------------------
+p7 <- ggplot(df, aes(x = 分支分组, y = 平均区域长度, fill = 分支分组)) +
+  geom_boxplot(outlier.shape = 21, outlier.size = 2) +
+  geom_jitter(width = 0.15, alpha = 0.7, size = 2) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 18)) +
+  labs(
+    title = "不同亚科-分支的R-loop平均区域长度",
+    x = "亚科 | 主要分支",
+    y = "平均区域长度"
+  ) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1),
+    plot.margin = margin(t = 10, r = 10, b = 35, l = 35)
+  )
+
+save_plot(p7, "07_branch_mean_length_boxplot.png", width = 10, height = 6)
+save_plot(p7, "07_branch_mean_length_boxplot.pdf", width = 10, height = 6)
+
+# ----------------------------
+# 8. 亚科：覆盖比例箱线图
+# ----------------------------
+df_sub_cov <- df %>%
+  mutate(亚科 = fct_reorder(亚科, Rloop覆盖比例, .fun = median, .desc = FALSE))
+
+p8 <- ggplot(df_sub_cov, aes(x = 亚科, y = Rloop覆盖比例, fill = 亚科)) +
+  geom_boxplot(outlier.shape = 21, outlier.size = 2) +
+  geom_jitter(width = 0.15, alpha = 0.7, size = 2) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 18)) +
+  labs(
+    title = "不同亚科的R-loop覆盖比例",
+    x = "亚科",
+    y = "R-loop覆盖比例"
+  ) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1),
+    plot.margin = margin(t = 10, r = 10, b = 35, l = 35)
+  )
+
+save_plot(p8, "08_subfamily_cov_ratio_boxplot.png", width = 9, height = 6)
+save_plot(p8, "08_subfamily_cov_ratio_boxplot.pdf", width = 9, height = 6)
+
+# ----------------------------
+# 9. 散点图：密度 vs 覆盖比例
+# ----------------------------
+p9 <- ggplot(df, aes(x = 每100Mb区域数, y = Rloop覆盖比例, color = 分支分组)) +
+  geom_point(size = 3, alpha = 0.9) +
+  labs(
+    title = "R-loop密度与覆盖比例的关系",
+    x = "每100Mb区域数",
+    y = "R-loop覆盖比例",
+    color = "亚科 | 主要分支"
+  )
+
+save_plot(p9, "09_density_vs_covratio_scatter.png", width = 8, height = 6)
+save_plot(p9, "09_density_vs_covratio_scatter.pdf", width = 8, height = 6)
+
+# ----------------------------
+# 10. 散点图：平均区域长度 vs 覆盖比例
+# ----------------------------
+p10 <- ggplot(df, aes(x = 平均区域长度, y = Rloop覆盖比例, color = 分支分组)) +
+  geom_point(size = 3, alpha = 0.9) +
+  labs(
+    title = "平均区域长度与覆盖比例的关系",
+    x = "平均区域长度",
+    y = "R-loop覆盖比例",
+    color = "亚科 | 主要分支"
+  )
+
+save_plot(p10, "10_meanlength_vs_covratio_scatter.png", width = 8, height = 6)
+save_plot(p10, "10_meanlength_vs_covratio_scatter.pdf", width = 8, height = 6)
+
+# ----------------------------
+# 11. 散点图：主染色体总长度 vs 覆盖比例（log10横坐标）
+# ----------------------------
+p11 <- ggplot(df, aes(x = 生物学主染色体总长度_Gb, y = Rloop覆盖比例, color = 分支分组)) +
+  geom_point(size = 3, alpha = 0.9) +
+  scale_x_log10() +
+  labs(
+    title = "主染色体总长度与R-loop覆盖比例的关系",
+    subtitle = "x轴为 log10 scale",
+    x = "生物学主染色体总长度 (Gb, log10 scale)",
+    y = "R-loop覆盖比例",
+    color = "亚科 | 主要分支"
+  )
+
+save_plot(p11, "11_chrsize_vs_covratio_scatter_log10.png", width = 8, height = 6)
+save_plot(p11, "11_chrsize_vs_covratio_scatter_log10.pdf", width = 8, height = 6)
+
+# ----------------------------
+# 12. 散点图：基因密度 vs 覆盖比例
+# ----------------------------
+df_gene_density <- df %>%
+  filter(!is.na(基因密度_per_Mb))
+
+p12 <- ggplot(df_gene_density, aes(x = 基因密度_per_Mb, y = Rloop覆盖比例, color = 分支分组)) +
+  geom_point(size = 3, alpha = 0.9) +
+  labs(
+    title = "基因密度与R-loop覆盖比例的关系",
+    x = "基因密度 (genes/Mb)",
+    y = "R-loop覆盖比例",
+    color = "亚科 | 主要分支"
+  )
+
+save_plot(p12, "12_gene_density_vs_covratio_scatter.png", width = 8, height = 6)
+save_plot(p12, "12_gene_density_vs_covratio_scatter.pdf", width = 8, height = 6)
+
+# ----------------------------
+# 13. 可选：GC content vs 覆盖比例
+# 如果 GC_content_main_chr 全是 NA，这张图自动跳过。
+# ----------------------------
+df_gc <- df %>%
+  filter(!is.na(GC含量))
+
+if (nrow(df_gc) > 0) {
+  p13 <- ggplot(df_gc, aes(x = GC含量, y = Rloop覆盖比例, color = 分支分组)) +
+    geom_point(size = 3, alpha = 0.9) +
+    labs(
+      title = "GC含量与R-loop覆盖比例的关系",
+      x = "GC content of main chromosomes",
+      y = "R-loop覆盖比例",
+      color = "亚科 | 主要分支"
+    )
+
+  save_plot(p13, "13_gc_vs_covratio_scatter.png", width = 8, height = 6)
+  save_plot(p13, "13_gc_vs_covratio_scatter.pdf", width = 8, height = 6)
+}
+
+# ----------------------------
+# 14. 分组统计表
+# ----------------------------
+branch_summary <- df %>%
+  group_by(分支分组) %>%
+  summarise(
+    物种数 = n(),
+    覆盖比例_中位数 = median(Rloop覆盖比例, na.rm = TRUE),
+    覆盖比例_平均值 = mean(Rloop覆盖比例, na.rm = TRUE),
+    密度_中位数 = median(每100Mb区域数, na.rm = TRUE),
+    密度_平均值 = mean(每100Mb区域数, na.rm = TRUE),
+    平均长度_中位数 = median(平均区域长度, na.rm = TRUE),
+    平均长度_平均值 = mean(平均区域长度, na.rm = TRUE),
+    每生物学染色体区域数_中位数 = median(平均每条生物学染色体区域数, na.rm = TRUE),
+    每生物学染色体区域数_平均值 = mean(平均每条生物学染色体区域数, na.rm = TRUE),
+    基因密度_中位数 = median(基因密度_per_Mb, na.rm = TRUE),
+    基因密度_平均值 = mean(基因密度_per_Mb, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(覆盖比例_中位数))
+
+write_tsv(branch_summary, file.path(outdir, "branch_summary.tsv"))
+
+subfamily_summary <- df %>%
+  group_by(亚科) %>%
+  summarise(
+    物种数 = n(),
+    覆盖比例_中位数 = median(Rloop覆盖比例, na.rm = TRUE),
+    覆盖比例_平均值 = mean(Rloop覆盖比例, na.rm = TRUE),
+    密度_中位数 = median(每100Mb区域数, na.rm = TRUE),
+    密度_平均值 = mean(每100Mb区域数, na.rm = TRUE),
+    平均长度_中位数 = median(平均区域长度, na.rm = TRUE),
+    平均长度_平均值 = mean(平均区域长度, na.rm = TRUE),
+    每生物学染色体区域数_中位数 = median(平均每条生物学染色体区域数, na.rm = TRUE),
+    每生物学染色体区域数_平均值 = mean(平均每条生物学染色体区域数, na.rm = TRUE),
+    基因密度_中位数 = median(基因密度_per_Mb, na.rm = TRUE),
+    基因密度_平均值 = mean(基因密度_per_Mb, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(覆盖比例_中位数))
+
+write_tsv(subfamily_summary, file.path(outdir, "subfamily_summary.tsv"))
+
+cat("完成。\n")
+cat("输入文件: ", normalizePath(input_file), "\n", sep = "")
+cat("输出目录: ", normalizePath(outdir), "\n", sep = "")
+cat("说明: 本脚本中的 Rloop覆盖比例 = Rloop_merged_coverage_ratio。\n")
+
+Rscript plot_rloop_summary_merged_coverage.R genedata_rloop_summary.tsv summary_plots_merged
+
+# genedata的另一组图也要改
+cat > plot_genedata_relationships.R <<'EOF'
+#!/usr/bin/env Rscript
+
+# 用法:
+# Rscript plot_genedata_relationships.R genedata_rloop_summary.tsv genedata_plots
+#
+# 默认:
+# input  = "genedata_rloop_summary.tsv"
+# outdir = "genedata_plots"
+
+args <- commandArgs(trailingOnly = TRUE)
+input_file <- if (length(args) >= 1) args[1] else "genedata_rloop_summary.tsv"
+outdir     <- if (length(args) >= 2) args[2] else "genedata_plots"
+
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+need_pkgs <- c("readr", "dplyr", "ggplot2", "forcats", "stringr")
+for (pkg in need_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop(sprintf("缺少R包: %s\n请先安装: install.packages('%s')", pkg, pkg))
+  }
+}
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(stringr)
+
+has_ggrepel <- requireNamespace("ggrepel", quietly = TRUE)
+
+df <- read_tsv(
+  input_file,
+  show_col_types = FALSE,
+  locale = locale(encoding = "UTF-8")
+)
+
+required_cols <- c(
+  "species",
+  "subfamily",
+  "major_branch",
+  "assembly_size_bp",
+  "assembly_main_chr_n",
+  "biological_main_chr_n",
+  "biological_main_chr_size_bp",
+  "gene_number_biological_main_chr",
+  "gene_density_per_Mb",
+  "GC_content_main_chr",
+  "Rloop_region_number",
+  "Rloop_mean_length",
+  "Rloop_density_per_100Mb",
+  "Rloop_coverage_ratio",
+  "Rloop_merged_coverage_ratio",
+  "Rloop_per_biological_chr_mean"
+)
+
+missing_cols <- setdiff(required_cols, colnames(df))
+if (length(missing_cols) > 0) {
+  stop("缺少必要列: ", paste(missing_cols, collapse = ", "))
+}
+
+num_cols <- c(
+  "assembly_size_bp",
+  "assembly_main_chr_n",
+  "biological_main_chr_n",
+  "biological_main_chr_size_bp",
+  "gene_number_biological_main_chr",
+  "gene_density_per_Mb",
+  "GC_content_main_chr",
+  "Rloop_region_number",
+  "Rloop_mean_length",
+  "Rloop_density_per_100Mb",
+  "Rloop_coverage_ratio",
+  "Rloop_merged_coverage_ratio",
+  "Rloop_per_biological_chr_mean"
+)
+
+df <- df %>%
+  mutate(across(all_of(num_cols), ~ suppressWarnings(as.numeric(.x))))
+
+make_species_label <- function(x) {
+  m <- stringr::str_match(x, "^([^_]+)_([^_]+)")
+  ifelse(
+    !is.na(m[, 1]),
+    paste(m[, 2], m[, 3], sep = " "),
+    x
+  )
+}
+
+branch_order <- c(
+  "Cercidoideae | basal_non_papilionoid",
+  "Detarioideae | basal_non_papilionoid",
+  "Dialioideae | basal_non_papilionoid",
+  "Caesalpinioideae | Cassieae",
+  "Caesalpinioideae | Mimoseae",
+  "Papilionoideae | dalbergioid",
+  "Papilionoideae | genistoid",
+  "Papilionoideae | IRLC",
+  "Papilionoideae | millettioid_phaseoloid"
+)
+
+df <- df %>%
+  mutate(
+    species_label = make_species_label(species),
+    branch_group = paste(subfamily, major_branch, sep = " | "),
+    branch_group = factor(branch_group, levels = branch_order),
+
+    assembly_size_Mb = assembly_size_bp / 1e6,
+    assembly_size_Gb = assembly_size_bp / 1e9,
+
+    biological_main_chr_size_Mb = biological_main_chr_size_bp / 1e6,
+    biological_main_chr_size_Gb = biological_main_chr_size_bp / 1e9,
+
+    Rloop_coverage_percent = Rloop_coverage_ratio * 100,
+    Rloop_merged_coverage_percent = Rloop_merged_coverage_ratio * 100
+  )
+
+write_tsv(df, file.path(outdir, "genedata_rloop_summary_cleaned.tsv"))
+
+theme_set(
+  theme_bw(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(face = "bold"),
+      legend.title = element_text(face = "bold")
+    )
+)
+
+save_plot <- function(p, filename, width = 8, height = 6) {
+  filepath <- file.path(outdir, filename)
+  if (grepl("\\.pdf$", filename, ignore.case = TRUE)) {
+    ggsave(
+      filename = filepath,
+      plot = p,
+      width = width,
+      height = height,
+      device = grDevices::cairo_pdf
+    )
+  } else {
+    ggsave(
+      filename = filepath,
+      plot = p,
+      width = width,
+      height = height,
+      dpi = 300
+    )
+  }
+}
+
+add_species_labels <- function(p, data) {
+  if (has_ggrepel) {
+    p + ggrepel::geom_text_repel(
+      data = data,
+      aes(label = species_label),
+      size = 3,
+      max.overlaps = 50,
+      box.padding = 0.3,
+      point.padding = 0.2
+    )
+  } else {
+    p + geom_text(
+      data = data,
+      aes(label = species_label),
+      size = 3,
+      vjust = -0.7,
+      check_overlap = TRUE
+    )
+  }
+}
+
+spearman_test <- function(data, x, y) {
+  tmp <- data %>%
+    filter(!is.na(.data[[x]]), !is.na(.data[[y]]))
+
+  if (nrow(tmp) < 3) {
+    return(tibble(
+      x = x,
+      y = y,
+      n = nrow(tmp),
+      spearman_rho = NA_real_,
+      p_value = NA_real_
+    ))
+  }
+
+  ct <- suppressWarnings(cor.test(tmp[[x]], tmp[[y]], method = "spearman", exact = FALSE))
+
+  tibble(
+    x = x,
+    y = y,
+    n = nrow(tmp),
+    spearman_rho = unname(ct$estimate),
+    p_value = ct$p.value
+  )
+}
+
+corr_table <- bind_rows(
+  spearman_test(df, "biological_main_chr_size_Gb", "Rloop_merged_coverage_percent"),
+  spearman_test(df, "assembly_size_Gb", "Rloop_merged_coverage_percent"),
+  spearman_test(df, "gene_density_per_Mb", "Rloop_merged_coverage_percent"),
+  spearman_test(df, "gene_number_biological_main_chr", "Rloop_merged_coverage_percent"),
+  spearman_test(df, "GC_content_main_chr", "Rloop_merged_coverage_percent"),
+  spearman_test(df, "Rloop_density_per_100Mb", "Rloop_merged_coverage_percent"),
+  spearman_test(df, "Rloop_mean_length", "Rloop_merged_coverage_percent"),
+  spearman_test(df, "Rloop_per_biological_chr_mean", "Rloop_merged_coverage_percent"),
+  spearman_test(df, "biological_main_chr_n", "Rloop_merged_coverage_percent"),
+  spearman_test(df, "assembly_main_chr_n", "Rloop_merged_coverage_percent")
+)
+
+write_tsv(corr_table, file.path(outdir, "spearman_correlation_summary.tsv"))
+
+# ----------------------------
+# 10. 覆盖比例排序图，点大小表示生物学主染色体总长度
+# ----------------------------
+
+df_cov <- df %>%
+  arrange(Rloop_merged_coverage_percent) %>%
+  mutate(species_label = factor(species_label, levels = species_label))
+
+p10 <- ggplot(
+  df_cov,
+  aes(
+    x = Rloop_merged_coverage_percent,
+    y = species_label,
+    color = branch_group,
+    size = biological_main_chr_size_Gb
+  )
+) +
+  geom_point(alpha = 0.9) +
+  scale_size_continuous(name = "Biological main chr size (Gb)", range = c(2.5, 8)) +
+  labs(
+    title = "R-loop coverage ratio with chromosome-size annotation",
+    x = "Merged R-loop coverage (%)",
+    y = "Species",
+    color = "Subfamily | major branch"
+  ) +
+  theme(
+    axis.text.y = element_text(size = 9),
+    legend.position = "right"
+  )
+
+save_plot(p10, "10_species_covratio_with_bio_chrsize_dotplot.png", width = 10, height = 9)
+save_plot(p10, "10_species_covratio_with_bio_chrsize_dotplot.pdf", width = 10, height = 9)
+
+# ----------------------------
+# 11. 覆盖比例 vs 生物学主染色体总长度
+# ----------------------------
+
+p11 <- ggplot(
+  df,
+  aes(
+    x = biological_main_chr_size_Gb,
+    y = Rloop_merged_coverage_percent,
+    color = branch_group
+  )
+) +
+  geom_point(size = 3.2, alpha = 0.9) +
+  labs(
+    title = "R-loop coverage vs biological main chromosome size",
+    x = "Biological main chromosome size (Gb)",
+    y = "Merged R-loop coverage (%)",
+    color = "Subfamily | major branch"
+  )
+
+p11 <- add_species_labels(p11, df)
+
+save_plot(p11, "11_covratio_vs_biological_main_chr_size_scatter.png", width = 8.5, height = 6.5)
+save_plot(p11, "11_covratio_vs_biological_main_chr_size_scatter.pdf", width = 8.5, height = 6.5)
+
+# log10版本，避免 Vicia faba 这类大基因组拉伸坐标
+p11_log <- ggplot(
+  df,
+  aes(
+    x = biological_main_chr_size_Gb,
+    y = Rloop_merged_coverage_percent,
+    color = branch_group
+  )
+) +
+  geom_point(size = 3.2, alpha = 0.9) +
+  scale_x_log10() +
+  labs(
+    title = "R-loop coverage vs biological main chromosome size",
+    subtitle = "x-axis in log10 scale",
+    x = "Biological main chromosome size (Gb, log10 scale)",
+    y = "Merged R-loop coverage (%)",
+    color = "Subfamily | major branch"
+  )
+
+p11_log <- add_species_labels(p11_log, df)
+
+save_plot(p11_log, "11_covratio_vs_biological_main_chr_size_log10_scatter.png", width = 8.5, height = 6.5)
+save_plot(p11_log, "11_covratio_vs_biological_main_chr_size_log10_scatter.pdf", width = 8.5, height = 6.5)
+
+# ----------------------------
+# 12. 覆盖比例 vs assembly size
+# ----------------------------
+
+p12 <- ggplot(
+  df,
+  aes(
+    x = assembly_size_Gb,
+    y = Rloop_merged_coverage_percent,
+    color = branch_group
+  )
+) +
+  geom_point(size = 3.2, alpha = 0.9) +
+  labs(
+    title = "R-loop coverage vs assembly size",
+    x = "Assembly size (Gb)",
+    y = "Merged R-loop coverage (%)",
+    color = "Subfamily | major branch"
+  )
+
+p12 <- add_species_labels(p12, df)
+
+save_plot(p12, "12_covratio_vs_assembly_size_scatter.png", width = 8.5, height = 6.5)
+save_plot(p12, "12_covratio_vs_assembly_size_scatter.pdf", width = 8.5, height = 6.5)
+
+# ----------------------------
+# 13. 覆盖比例 vs gene density
+# ----------------------------
+
+df_gene_density <- df %>%
+  filter(!is.na(gene_density_per_Mb))
+
+p13 <- ggplot(
+  df_gene_density,
+  aes(
+    x = gene_density_per_Mb,
+    y = Rloop_merged_coverage_percent,
+    color = branch_group
+  )
+) +
+  geom_point(size = 3.2, alpha = 0.9) +
+  labs(
+    title = "R-loop coverage vs gene density",
+    x = "Gene density (genes/Mb)",
+    y = "Merged R-loop coverage (%)",
+    color = "Subfamily | major branch"
+  )
+
+p13 <- add_species_labels(p13, df_gene_density)
+
+save_plot(p13, "13_covratio_vs_gene_density_scatter.png", width = 8.5, height = 6.5)
+save_plot(p13, "13_covratio_vs_gene_density_scatter.pdf", width = 8.5, height = 6.5)
+
+# ----------------------------
+# 14. 覆盖比例 vs GC content
+# ----------------------------
+
+df_gc <- df %>%
+  filter(!is.na(GC_content_main_chr))
+
+if (nrow(df_gc) >= 3) {
+  p14 <- ggplot(
+    df_gc,
+    aes(
+      x = GC_content_main_chr * 100,
+      y = Rloop_merged_coverage_percent,
+      color = branch_group
+    )
+  ) +
+    geom_point(size = 3.2, alpha = 0.9) +
+    labs(
+      title = "R-loop coverage vs GC content",
+      x = "GC content on main chromosomes (%)",
+      y = "Merged R-loop coverage (%)",
+      color = "Subfamily | major branch"
+    )
+
+  p14 <- add_species_labels(p14, df_gc)
+
+  save_plot(p14, "14_covratio_vs_gc_content_scatter.png", width = 8.5, height = 6.5)
+  save_plot(p14, "14_covratio_vs_gc_content_scatter.pdf", width = 8.5, height = 6.5)
+}
+
+# ----------------------------
+# 15. 覆盖比例 vs 平均每条生物学染色体R-loop区域数
+# ----------------------------
+
+p15 <- ggplot(
+  df,
+  aes(
+    x = Rloop_per_biological_chr_mean,
+    y = Rloop_merged_coverage_percent,
+    color = branch_group
+  )
+) +
+  geom_point(size = 3.2, alpha = 0.9) +
+  labs(
+    title = "R-loop coverage vs mean R-loop regions per biological chromosome",
+    x = "Mean R-loop regions per biological chromosome",
+    y = "Merged R-loop coverage (%)",
+    color = "Subfamily | major branch"
+  )
+
+p15 <- add_species_labels(p15, df)
+
+save_plot(p15, "15_covratio_vs_rloop_per_biological_chr_scatter.png", width = 8.5, height = 6.5)
+save_plot(p15, "15_covratio_vs_rloop_per_biological_chr_scatter.pdf", width = 8.5, height = 6.5)
+
+# ----------------------------
+# 16. 覆盖比例 vs 生物学染色体数
+# ----------------------------
+
+p16 <- ggplot(
+  df,
+  aes(
+    x = biological_main_chr_n,
+    y = Rloop_merged_coverage_percent,
+    color = branch_group
+  )
+) +
+  geom_point(size = 3.2, alpha = 0.9) +
+  labs(
+    title = "R-loop coverage vs biological chromosome number",
+    x = "Biological main chromosome number",
+    y = "Merged R-loop coverage (%)",
+    color = "Subfamily | major branch"
+  )
+
+p16 <- add_species_labels(p16, df)
+
+save_plot(p16, "16_covratio_vs_biological_chr_number_scatter.png", width = 8.5, height = 6.5)
+save_plot(p16, "16_covratio_vs_biological_chr_number_scatter.pdf", width = 8.5, height = 6.5)
+
+cat("完成。\n")
+cat("输入文件: ", normalizePath(input_file), "\n", sep = "")
+cat("输出目录: ", normalizePath(outdir), "\n", sep = "")
+cat("相关性统计表: ", normalizePath(file.path(outdir, "spearman_correlation_summary.tsv")), "\n", sep = "")
+cat("说明: 本脚本使用 biological_main_chr_size_bp 和 Rloop_per_biological_chr_mean。\n")
+EOF
+Rscript plot_genedata_relationships.R genedata_rloop_summary.tsv genedata_plots
