@@ -252,3 +252,38 @@ bedtools complement \
 } > "$OUTDIR/region_total_bp.tsv"
 
 echo "[OK] annotation BED files created in: $OUTDIR"
+
+chmod +x build_annotation_regions_3class.sh
+# 运行脚本
+OUTROOT=/data/mshe/deepRloopPro_data/annotation_beds_3class
+SCRIPT=/data/mshe/deepRloopPro_data/build_annotation_regions_3class.sh
+PROMOTER_UP=2000
+PROMOTER_DOWN=500
+TTS_BP=2000
+FEATURE_TYPE=gene
+
+mkdir -p "$OUTROOT"
+
+while IFS=$'\t' read -r sp anno chrom
+do
+    echo "=================================================="
+    echo "[INFO] processing $sp"
+
+    bash "$SCRIPT" \
+      "$anno" \
+      "$chrom" \
+      "$OUTROOT/$sp" \
+      "$PROMOTER_UP" \
+      "$PROMOTER_DOWN" \
+      "$TTS_BP" \
+      "$FEATURE_TYPE"
+
+done < /data/mshe/deepRloopPro_data/annotation_list_new.tsv
+
+# Dalbergia和Zenia俩物种的gff没有 gene ，难以定义gene body 故删除
+rm -r annotation_beds_3class/Dalbergia_cochinchinensis_GCA_031216125.1/ annotation_beds_3class/Zenia_insignis_GCA_052059195.1/
+grep -v -E 'Dalbergia_cochinchinensis_GCA_031216125.1|Zenia_insignis_GCA_052059195.1' \
+  /data/mshe/deepRloopPro_data/annotation_list_new.tsv \
+  > /data/mshe/deepRloopPro_data/annotation_list_gene_feature_only.tsv
+
+
