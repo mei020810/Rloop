@@ -116,7 +116,7 @@ echo "[INFO] gene body retained: $gene_n"
 #   TSS = gene end
 #   promoter = [TSS - DOWN, TSS + UP)
 #
-# 注意：这里是 BED 的 0-based half-open 坐标。
+# 注意：这里是 BED 的 0-based half-open 坐标
 # ------------------------------------------------------------
 awk -v UP="$PROMOTER_UP" -v DOWN="$PROMOTER_DOWN" -v FT="$FEATURE_TYPE" 'BEGIN{FS=OFS="\t"}
 function get_id(attr, id) {
@@ -218,7 +218,7 @@ cut -f1-3 "$OUTDIR/tts_${TTS_BP}bp.bed" \
 # ------------------------------------------------------------
 # 4. gene-associated union
 # 注意：promoter 和 gene body 本来会重叠，所以这里只能作为 union 使用，
-# 不能把 promoter / gene body / TTS 的 bp 直接相加。
+# 不能把 promoter / gene body / TTS 的 bp 直接相加
 # ------------------------------------------------------------
 cat \
   "$OUTDIR/promoter_TSS_${PROMOTER_UP}up_${PROMOTER_DOWN}down.merged.bed" \
@@ -286,4 +286,446 @@ grep -v -E 'Dalbergia_cochinchinensis_GCA_031216125.1|Zenia_insignis_GCA_0520591
   /data/mshe/deepRloopPro_data/annotation_list_new.tsv \
   > /data/mshe/deepRloopPro_data/annotation_list_gene_feature_only.tsv
 
+# 以end_point定义peak
+vim classify_rloop_by_endpoint.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Usage:
+# bash classify_rloop_by_endpoint.sh \
+#   <rloop_peaks.bed> \
+#   <promoter.merged.bed> \
+#   <gene_body.merged.bed> \
+#   <tts.merged.bed> \
+#   <chromsize> \
+#   <outprefix> \
+#   [end_mode]
+#
+# end_mode:
+#   genome_end  : 不考虑 strand，永远用 BED 第3列 end 作为 peak 终点，默认
+#   strand_end  : 如果 peak 第6列为 -，则用 BED 第2列 start 作为转录方向终点；
+#                 如果为 + 或没有 strand，则用第3列 end
+#
+# Example:
+# bash classify_rloop_by_endpoint.sh \
+#   sample.rloop.bed \
+#   anno_bed/promoter_TSS_2000up_500down.merged.bed \
+#   anno_bed/gene_body.merged.bed \
+#   anno_bed/tts_2000bp.merged.bed \
+#   genome.chrom.sizes \
+#   sample.rloop.location \
+#   genome_end
+
+if [[ $# -lt 6 ]]; then
+  echo "Usage: bash $0 <rloop_peaks.bed> <promoter.merged.bed> <gene_body.merged.bed> <tts.merged.bed> <chromsize> <outprefix> [genome_end|strand_end]" >&2
+  exit 1
+fi
+
+PEAKS="$1"
+PROMOTER="$2"
+GENE_BODY="$3"
+TTS="$4"
+CHROMSIZE="$5"
+OUTPREFIX="$6"
+END_MODE="${7:-genome_end}"
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "[ERROR] missing command: $1" >&2
+    exit 1
+  }
+}
+
+need_cmd awk
+need_cmd bedtools
+
+if [[ "$END_MODE" != "genome_end" && "$END_MODE" != "strand_end" ]]; then
+  echo "[ERROR] end_mode must be genome_end or strand_end" >&2
+  exit 1
+fi
+
+for f in "$PEAKS" "$PROMOTER" "$GENE_BODY" "$TTS" "$CHROMSIZE"; do
+  if [[ ! -f "$f" ]]; then
+    echo "[ERROR] file not found: $f" >&2
+    exit 1
+  fi
+done
+
+TMPDIR="${OUTPREFIX}.tmp"
+mkdir -p "$TMPDIR"
+
+echo "[INFO] peaks      = $PEAKS"
+echo "[INFO] promoter   = $PROMOTER"
+echo "[INFO] gene_body  = $GENE_BODY"
+echo "[INFO] tts        = $TTS"
+echo "[INFO] chromsize  = $CHROMSIZE"
+echo "[INFO] outprefix  = $OUTPREFIX"
+echo "[INFO] end_mode   = $END_MODE"
+
+# ------------------------------------------------------------
+# 1. Convert each R-loop peak to a 1-bp endpoint BED.
+#
+# Output columns:
+# chr, endpoint_start, endpoint_end, peak_id, score, strand,
+# original_peak_start, original_peak_end, original_extra_columns...
+# ------------------------------------------------------------
+awk -v MODE="$END_MODE" 'BEGIN{FS=OFS="\t"}
+FNR==NR {
+  keep[$1] = 1
+  next
+}
+$0 !~ /^#/ && NF >= 3 && ($1 in keep) {
+  chr = $1
+  peak_start = $2
+  peak_end = $3
+
+  if (peak_end <= peak_start) next
+
+  id = (NF >= 4 && $4 != "" ? $4 : "peak_" NR)
+  score = (NF >= 5 && $5 != "" ? $5 : ".")
+  strand = (NF >= 6 && $6 != "" ? $6 : ".")
+
+  if (MODE == "strand_end" && strand == "-") {
+    s = peak_start
+    e = peak_start + 1
+  } else {
+    s = peak_end - 1
+    e = peak_end
+  }
+
+  if (s < 0) s = 0
+  if (e <= s) next
+
+  printf "%s\t%d\t%d\t%s\t%s\t%s\t%d\t%d", chr, s, e, id, score, strand, peak_start, peak_end
+
+  for (i = 4; i <= NF; i++) {
+    printf "\t%s", $i
+  }
+  printf "\n"
+}' "$CHROMSIZE" "$PEAKS" \
+  | bedtools sort -g "$CHROMSIZE" -i - \
+  > "$TMPDIR/rloop_endpoint.1bp.bed"
+
+endpoint_n=$(wc -l < "$TMPDIR/rloop_endpoint.1bp.bed")
+echo "[INFO] endpoint records retained: $endpoint_n"
+
+# ------------------------------------------------------------
+# 2. Classify by endpoint.
+#
+# Priority:
+#   promoter > gene_body > TTS > intergenic
+#
+# 这样可以避免 promoter 与 gene body 重叠导致重复计数。
+# ------------------------------------------------------------
+
+bedtools intersect \
+  -u \
+  -a "$TMPDIR/rloop_endpoint.1bp.bed" \
+  -b "$PROMOTER" \
+  > "${OUTPREFIX}.promoter.endpoint.bed"
+
+bedtools intersect \
+  -v \
+  -a "$TMPDIR/rloop_endpoint.1bp.bed" \
+  -b "$PROMOTER" \
+  > "$TMPDIR/not_promoter.bed"
+
+bedtools intersect \
+  -u \
+  -a "$TMPDIR/not_promoter.bed" \
+  -b "$GENE_BODY" \
+  > "${OUTPREFIX}.gene_body.endpoint.bed"
+
+bedtools intersect \
+  -v \
+  -a "$TMPDIR/not_promoter.bed" \
+  -b "$GENE_BODY" \
+  > "$TMPDIR/not_promoter_not_gene_body.bed"
+
+bedtools intersect \
+  -u \
+  -a "$TMPDIR/not_promoter_not_gene_body.bed" \
+  -b "$TTS" \
+  > "${OUTPREFIX}.tts.endpoint.bed"
+
+bedtools intersect \
+  -v \
+  -a "$TMPDIR/not_promoter_not_gene_body.bed" \
+  -b "$TTS" \
+  > "${OUTPREFIX}.intergenic.endpoint.bed"
+
+# ------------------------------------------------------------
+# 3. Merge classified result
+# ------------------------------------------------------------
+{
+  awk 'BEGIN{FS=OFS="\t"}{print "promoter",$0}' "${OUTPREFIX}.promoter.endpoint.bed"
+  awk 'BEGIN{FS=OFS="\t"}{print "gene_body",$0}' "${OUTPREFIX}.gene_body.endpoint.bed"
+  awk 'BEGIN{FS=OFS="\t"}{print "tts",$0}' "${OUTPREFIX}.tts.endpoint.bed"
+  awk 'BEGIN{FS=OFS="\t"}{print "intergenic",$0}' "${OUTPREFIX}.intergenic.endpoint.bed"
+} > "${OUTPREFIX}.classified_endpoint.tsv"
+
+# ------------------------------------------------------------
+# 4. Summary
+# ------------------------------------------------------------
+{
+  echo -e "class\tcount"
+  echo -e "promoter\t$(wc -l < "${OUTPREFIX}.promoter.endpoint.bed")"
+  echo -e "gene_body\t$(wc -l < "${OUTPREFIX}.gene_body.endpoint.bed")"
+  echo -e "tts\t$(wc -l < "${OUTPREFIX}.tts.endpoint.bed")"
+  echo -e "intergenic\t$(wc -l < "${OUTPREFIX}.intergenic.endpoint.bed")"
+  echo -e "total\t$(wc -l < "${OUTPREFIX}.classified_endpoint.tsv")"
+} > "${OUTPREFIX}.summary.tsv"
+
+echo "[OK] classification finished:"
+echo "  ${OUTPREFIX}.promoter.endpoint.bed"
+echo "  ${OUTPREFIX}.gene_body.endpoint.bed"
+echo "  ${OUTPREFIX}.tts.endpoint.bed"
+echo "  ${OUTPREFIX}.intergenic.endpoint.bed"
+echo "  ${OUTPREFIX}.classified_endpoint.tsv"
+echo "  ${OUTPREFIX}.summary.tsv"
+
+chmod +x classify_rloop_by_endpoint.sh
+#运行脚本
+RESROOT=/data/mshe/deepRloopPro_data/deepRloop_results_A
+ANNROOT=/data/mshe/deepRloopPro_data/annotation_beds_3class
+OUTROOT=/data/mshe/deepRloopPro_data/rloop_endpoint_3class
+SCRIPT=/data/mshe/deepRloopPro_data/classify_rloop_by_endpoint.sh
+LIST=/data/mshe/deepRloopPro_data/annotation_list_gene_feature_only.tsv
+END_MODE=strand_end
+mkdir -p "$OUTROOT"
+
+while IFS=$'\t' read -r sp anno chrom
+do
+    echo "=================================================="
+    echo "[INFO] classify R-loop endpoint: $sp"
+
+    finalbed="$RESROOT/${sp}_final_predict.bed"
+    anndir="$ANNROOT/$sp"
+
+    promoter="$anndir/promoter_TSS_2000up_500down.merged.bed"
+    gene_body="$anndir/gene_body.merged.bed"
+    tts="$anndir/tts_2000bp.merged.bed"
+
+    outdir="$OUTROOT/$sp"
+    mkdir -p "$outdir"
+
+    outprefix="$outdir/${sp}.rloop_endpoint_3class"
+
+    if [[ ! -s "$finalbed" ]]; then
+        echo "[WARN] missing finalbed: $finalbed"
+        continue
+    fi
+
+    if [[ ! -s "$promoter" ]]; then
+        echo "[WARN] missing promoter bed: $promoter"
+        continue
+    fi
+
+    if [[ ! -s "$gene_body" ]]; then
+        echo "[WARN] missing gene_body bed: $gene_body"
+        continue
+    fi
+
+    if [[ ! -s "$tts" ]]; then
+        echo "[WARN] missing tts bed: $tts"
+        continue
+    fi
+
+    if [[ ! -s "$chrom" ]]; then
+        echo "[WARN] missing chromsize: $chrom"
+        continue
+    fi
+
+    bash "$SCRIPT" \
+      "$finalbed" \
+      "$promoter" \
+      "$gene_body" \
+      "$tts" \
+      "$chrom" \
+      "$outprefix" \
+      "$END_MODE"
+
+done < "$LIST"
+#合成总表
+OUTROOT=/data/mshe/deepRloopPro_data/rloop_endpoint_3class
+echo -e "species\tclass\tcount" > "$OUTROOT/all_species_rloop_endpoint_3class.tsv"
+find "$OUTROOT" -mindepth 2 -maxdepth 2 -name "*.summary.tsv" | sort | while read -r f
+do
+    sp=$(basename "$f" .rloop_endpoint_3class.summary.tsv)
+
+    awk -v sp="$sp" 'BEGIN{FS=OFS="\t"}
+    NR > 1 {
+        print sp, $1, $2
+    }' "$f"
+
+done >> "$OUTROOT/all_species_rloop_endpoint_3class.tsv"
+column -t -s $'\t' "$OUTROOT/all_species_rloop_endpoint_3class.tsv" | less -S
+
+#生成带有分支的的表
+IN=/data/mshe/deepRloopPro_data/rloop_endpoint_3class/all_species_rloop_endpoint_3class.tsv
+OUT=/data/mshe/deepRloopPro_data/rloop_endpoint_3class/all_species_rloop_endpoint_3class.wide.tsv
+rm -f "$OUT" "${OUT}.tmp"
+awk 'BEGIN{FS=OFS="\t"}
+NR==1 {next}
+$1 == "species" {next}
+{
+    sp=$1
+    cls=$2
+    count=$3
+    data[sp,cls]=count
+    species[sp]=1
+}
+END {
+    for (sp in species) {
+        print sp, \
+              data[sp,"promoter"]+0, \
+              data[sp,"gene_body"]+0, \
+              data[sp,"tts"]+0, \
+              data[sp,"intergenic"]+0, \
+              data[sp,"total"]+0
+    }
+}' "$IN" | sort -k1,1 > "${OUT}.tmp"
+{
+    echo -e "species\tpromoter\tgene_body\ttts\tintergenic\ttotal"
+    cat "${OUT}.tmp"
+} > "$OUT"
+rm -f "${OUT}.tmp"
+head -n 5 "$OUT" | column -t -s $'\t'
+#加分支
+MAP=species_branch_map_20.clean.tsv
+IN=rloop_endpoint_3class/all_species_rloop_endpoint_3class.wide.tsv
+OUT=rloop_endpoint_3class/all_species_rloop_endpoint_3class_with_branch.tsv
+awk 'BEGIN{FS=OFS="\t"}
+NR==FNR {
+    if (FNR==1) next
+    subfamily[$1]=$2
+    branch[$1]=$3
+    next
+}
+FNR==1 {
+    print "species","subfamily","major_branch",$2,$3,$4,$5,$6
+    next
+}
+{
+    sp=$1
+    sf=(sp in subfamily ? subfamily[sp] : "NA")
+    br=(sp in branch ? branch[sp] : "NA")
+
+    if (sf=="NA" || br=="NA") {
+        print "[WARN] species not found in map: " sp > "/dev/stderr"
+    }
+
+    print sp,sf,br,$2,$3,$4,$5,$6
+}' "$MAP" "$IN" > "$OUT"
+column -t -s $'\t' /data/mshe/deepRloopPro_data/rloop_endpoint_3class/all_species_rloop_endpoint_3class_with_branch.tsv | less -S
+# 加一个plot_group
+IN=/data/mshe/deepRloopPro_data/rloop_endpoint_3class/all_species_rloop_endpoint_3class_with_branch.tsv
+OUT=/data/mshe/deepRloopPro_data/rloop_endpoint_3class/all_species_rloop_endpoint_3class_with_plot_group.tsv
+awk 'BEGIN{FS=OFS="\t"}
+NR==1 {
+    print $1,$2,$3,"plot_group",$4,$5,$6,$7,$8
+    next
+}
+{
+    if ($3=="basal_non_papilionoid" || $3=="NA" || $3=="") {
+        plot_group=$2
+    } else {
+        plot_group=$2 " / " $3
+    }
+
+    print $1,$2,$3,plot_group,$4,$5,$6,$7,$8
+}' "$IN" > "$OUT"
+column -t -s $'\t' "$OUT" | less -S
+
+#按亚科分支作图
+conda activate tidyverse
+R
+library(tidyverse)
+indir <- "/data/mshe/deepRloopPro_data/rloop_endpoint_3class"
+df <- read_tsv(
+  file.path(indir, "all_species_rloop_endpoint_3class_with_plot_group.tsv"),
+  show_col_types = FALSE
+)
+
+# 数值列
+df <- df %>%
+  mutate(
+    promoter = as.numeric(promoter),
+    gene_body = as.numeric(gene_body),
+    tts = as.numeric(tts),
+    intergenic = as.numeric(intergenic),
+    total = as.numeric(total)
+  )
+
+# 简化物种名
+df <- df %>%
+  mutate(
+    species_short = species %>%
+      str_remove("_GCA_.*") %>%
+      str_remove("_GCF_.*") %>%
+      str_remove("_GWHD.*") %>%
+      str_remove("_LIS$")
+  )
+
+# 计算比例
+plot_df <- df %>%
+  mutate(
+    region_sum = promoter + gene_body + tts + intergenic
+  ) %>%
+  pivot_longer(
+    cols = c(promoter, gene_body, tts, intergenic),
+    names_to = "region",
+    values_to = "count"
+  ) %>%
+  mutate(
+    prop = count / region_sum,
+    region = factor(region, levels = c("promoter", "gene_body", "tts", "intergenic"))
+  )
+
+# 物种排序：先按 plot_group，再按 promoter 比例排序
+species_order <- plot_df %>%
+  filter(region == "promoter") %>%
+  arrange(plot_group, desc(prop)) %>%
+  pull(species_short)
+
+plot_df <- plot_df %>%
+  mutate(
+    species_short = factor(species_short, levels = rev(unique(species_order)))
+  )
+
+# 图1：按 plot_group 分面的物种堆叠比例图
+p1 <- ggplot(plot_df, aes(x = species_short, y = prop, fill = region)) +
+  geom_col(width = 0.8) +
+  coord_flip() +
+  facet_grid(plot_group ~ ., scales = "free_y", space = "free_y") +
+  scale_y_continuous(labels = function(x) paste0(round(x * 100), "%")) +
+  labs(
+    x = NULL,
+    y = "Proportion of R-loop 3' endpoints",
+    fill = "Region",
+    title = "Genomic distribution of R-loop 3' endpoints across legume lineages"
+  ) +
+  theme_bw() +
+  theme(
+    strip.text.y = element_text(angle = 0, face = "bold"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(size = 8),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+ggsave(
+  filename = file.path(indir, "05_rloop_endpoint_region_proportion_by_branch_facet.pdf"),
+  plot = p1,
+  width = 9,
+  height = 8
+)
+
+ggsave(
+  filename = file.path(indir, "05_rloop_endpoint_region_proportion_by_branch_facet.png"),
+  plot = p1,
+  width = 9,
+  height = 8,
+  dpi = 300
+)
 
