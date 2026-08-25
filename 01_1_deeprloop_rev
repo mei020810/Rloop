@@ -1,1 +1,53 @@
+# deepRloopPre 默认使用--strand fwd 得到的 peak 均为 + 链上的，现需要补做--strand rev 得到-链的rloop
 
+vim run_deepRloop_A_rev.sh
+#!/usr/bin/env bash
+set -euo pipefail
+MODEL=/home/mshe/deepRloop_models/transfer_scale128_single_13_0.29202.hdf5
+RUNLIST=/data/mshe/deepRloopPro_data/new_list_A.tsv
+OUTDIR=/data/mshe/deepRloopPro_data/deepRloop_results_A_rev
+LOGDIR=/data/mshe/deepRloopPro_data/deepRloop_logs_A_rev
+MAXJOBS=8
+mkdir -p "$OUTDIR" "$LOGDIR"
+while IFS=$'\t' read -r PREFIX FASTA CHROMSIZE FAI
+do
+    RUN_PREFIX="${PREFIX}_rev"
+    FINALBED="${OUTDIR}/${RUN_PREFIX}_final_predict.bed"
+    LOGFILE="${LOGDIR}/${RUN_PREFIX}.log"
+    # 已经跑完：跳过
+    if [[ -s "$FINALBED" ]]; then
+        echo "[SKIP DONE] $RUN_PREFIX"
+        continue
+    fi
+    # 已经在跑：跳过
+    if pgrep -af "deepRloopPredict.py" \
+        | grep -Fq -- "--prefix ${RUN_PREFIX}"
+    then
+        echo "[SKIP RUNNING] $RUN_PREFIX"
+        continue
+    fi
+    # 控制并行任务数
+    while [[ "$(jobs -pr | wc -l)" -ge "$MAXJOBS" ]]; do
+        sleep 30
+    done
+    (
+        cd "$OUTDIR"
+        echo "[START] $(date '+%F %T') $RUN_PREFIX"
+        deepRloopPredict.py \
+          --h5 "$MODEL" \
+          --fasta "$FASTA" \
+          --chromsize "$CHROMSIZE" \
+          --prefix "$RUN_PREFIX" \
+          --strand rev \
+          > "$LOGFILE" 2>&1
+        if [[ ! -s "$FINALBED" ]]; then
+            echo "[ERROR] expected output not generated: $FINALBED" >&2
+            exit 1
+        fi
+        echo "[DONE] $(date '+%F %T') $RUN_PREFIX"
+    ) &
+done < "$RUNLIST"
+wait
+echo "[ALL DONE] $(date '+%F %T')"
+chmod +x run_deepRloop_A_rev.sh
+nohup /data/mshe/deepRloopPro_data/run_deepRloop_A_rev.sh > /data/mshe/deepRloopPro_data/run_deepRloop_A_rev.master.log 2>&1 &
