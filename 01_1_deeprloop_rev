@@ -51,3 +51,4 @@ wait
 echo "[ALL DONE] $(date '+%F %T')"
 chmod +x run_deepRloop_A_rev.sh
 nohup /data/mshe/deepRloopPro_data/run_deepRloop_A_rev.sh > /data/mshe/deepRloopPro_data/run_deepRloop_A_rev.master.log 2>&1 &
+
