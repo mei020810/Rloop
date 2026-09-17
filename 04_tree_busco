@@ -1,1 +1,230 @@
 
+#下载80个属的基因组，利用单拷贝直系同源基因构建进化树
+#基因组文件位置：/data/mshe/deepRloopPro_data/legume_phylogeny/00_genomes/
+
+#构建环境（busco6需要大量依赖包，与其他软件冲突，故分开两个环境）
+mamba create -n busco6 \
+  --override-channels \
+  -c conda-forge \
+  -c bioconda \
+  busco=6.1.0
+
+mamba create -n legume_phylo \
+  --override-channels \
+  -c conda-forge \
+  -c bioconda \
+  mafft \
+  trimal \
+  clipkit \
+  iqtree \
+  astral-tree \
+  busco_phylogenomics \
+  seqkit
+
+
+mkdir -p /data/mshe/deepRloopPro_data/legume_phylogeny/00_genomes
+mv /data/mshe/deepRloopPro_data/gene_fasta/* /data/mshe/deepRloopPro_data/legume_phylogeny/00_genomes/
+rm -r /data/mshe/deepRloopPro_data/gene_fasta/
+#解压
+mkdir -p unpacked
+for z in *.zip
+do
+    base="${z%.zip}"
+    mkdir -p "unpacked/$base"
+    unzip -q "$z" -d "unpacked/$base"
+done
+#将所有的fasta文件汇集
+mkdir -p genomes_fasta
+find unpacked -type f \( -name "*genomic.fna" -o -name "*.fna" -o -name "*.fa" -o -name "*.fasta" \)
+#只有mimosa物种不是fna结尾，改一下名
+mv unpacked/Mimosa_bimucronata_GWHDODZ00000000/Mimosa_bimucronata_GWHDODZ00000000.fa unpacked/Mimosa_bimucronata_GWHDODZ00000000/Mimosa_bimucronata_GWHDODZ00000000.fna
+find unpacked -type f -name "*.fna" | wc -l
+cd /data/mshe/deepRloopPro_data/legume_phylogeny
+#汇集脚本（为了省空间，主要是建立软连接）
+vim prepare_genomes.sh
+
+#!/usr/bin/env bash
+set -euo pipefail
+SRC="00_genomes/unpacked" #基因组所在真正位置
+DEST="00_genomes/genomes_fasta"
+REPORT="00_genomes/genome_manifest.tsv"
+mkdir -p "$DEST"
+echo -e "Sample\tSource_FASTA\tFinal_FASTA\tStatus" > "$REPORT"
+for d in "$SRC"/*; do
+    [ -d "$d" ] || continue
+    sample=$(basename "$d")
+    echo "========================================"
+    echo "Processing: $sample"
+    mapfile -t fasta_files < <(
+        find "$d" -type f -name "*.fna" | sort
+    )
+    n=${#fasta_files[@]}
+    if [ "$n" -ne 1 ]; then
+        echo "ERROR: found $n FASTA files"
+        if [ "$n" -gt 0 ]; then
+            printf '%s\n' "${fasta_files[@]}"
+        fi
+        echo -e "${sample}\tNA\tNA\tERROR_${n}_FASTA" \
+            >> "$REPORT"
+
+        continue
+    fi
+    fasta="${fasta_files[0]}"
+    final="${DEST}/${sample}.fna"
+    ln -sfn "$(realpath "$fasta")" "$final"
+    echo "Source:"
+    echo "$fasta"
+    echo "Link:"
+    echo "$final"
+    echo -e "${sample}\t${fasta}\t${final}\tOK" \
+        >> "$REPORT"
+done
+echo
+echo "========================================"
+echo "Finished"
+echo
+echo "Number of genome FASTA links:"
+find "$DEST" -maxdepth 1 -type l -name "*.fna" | wc -l
+echo
+echo "Errors:"
+grep -v $'\tOK$' "$REPORT" | tail -n +2 || true
+
+chmod +x prepare_genomes.sh
+./prepare_genomes.sh
+
+#BUSCO阶段
+conda activate busco6
+#查询busco和数据库版本
+busco --version > busco_version.txt
+busco --list-datasets | grep -i fabales
+which busco
+#输出结果为- fabales_odb12.2 [7702]
+mkdir -p 01_busco_db
+busco --download fabales_odb12.2 \
+      --download_path 01_busco_db #此步将数据库保存到本地，为了可重复性
+# busco6 默认的真核生物genome mode是miniprot。该模式速度快，但是其不适合做下游分析，所以考虑 Metseuk 和 Augustus 模式，Metaeuk模式更快，但Augustus模式更准确。所以下面将选取五个不同亚科的物种进行测试两种模式
+#1.检查Augustus是否完整安装
+which augustus
+augustus --version
+which tblastn
+tblastn -version
+
+echo "$AUGUSTUS_CONFIG_PATH"
+grep -E \
+'creation_date|number_of_BUSCOs|species|augustus' \
+01_busco_db/lineages/fabales_odb12.2/dataset.cfg
+#先用Bauhinia做测试
+mkdir -p 01_busco_benchmark
+LINEAGE=$(realpath 01_busco_db/lineages/fabales_odb12.2) #指定lineage路径
+#Metaeuk模式
+/usr/bin/time -v \
+busco \
+  -i 00_genomes/genomes_fasta/Bauhinia_variegata_GCA_022379115.2.fna \
+  -m genome \
+  -l "$LINEAGE" \
+  --metaeuk \
+  --offline \
+  -o Bauhinia_metaeuk \
+  --out_path 01_busco_benchmark \
+  -c 16 \
+  2> 01_busco_benchmark/Bauhinia_metaeuk.time.txt
+#Augustus模式
+/usr/bin/time -v \
+busco \
+  -i 00_genomes/genomes_fasta/Bauhinia_variegata_GCA_022379115.2.fna \
+  -m genome \
+  -l "$LINEAGE" \
+  --augustus \
+  --offline \
+  -o Bauhinia_augustus \
+  --out_path 01_busco_benchmark \
+  -c 16 \
+  2> 01_busco_benchmark/Bauhinia_augustus.time.txt
+#跑完之后的比较数值
+#比较C、S、D、F、M
+grep -H "C:" \
+01_busco_benchmark/Bauhinia_*/short_summary.specific.*.txt
+#比较 single-copy marker 数
+find 01_busco_benchmark/Bauhinia_metaeuk \
+  -path "*/single_copy_busco_sequences/*.faa" | wc -l
+find 01_busco_benchmark/Bauhinia_augustus \
+  -path "*/single_copy_busco_sequences/*.faa" | wc -l
+#比较运行资源
+grep -E \
+"Elapsed|Maximum resident" \
+01_busco_benchmark/Bauhinia_*.time.txt
+#比较两种方法得到了多少相同的busco
+find 01_busco_benchmark/Bauhinia_metaeuk \
+  -path "*/single_copy_busco_sequences/*.faa" \
+  -exec basename {} .faa \; \
+  | sort > metaeuk.single.ids
+find 01_busco_benchmark/Bauhinia_augustus \
+  -path "*/single_copy_busco_sequences/*.faa" \
+  -exec basename {} .faa \; \
+  | sort > augustus.single.ids
+comm -12 \
+    metaeuk.single.ids \
+    augustus.single.ids \
+    | wc -l
+#各自的数
+wc -l metaeuk.single.ids augustus.single.ids
+#测试其他三个物种
+vim run_busco_benchmark.sh
+
+#!/usr/bin/env bash
+set -euo pipefail
+GENOMES="00_genomes/genomes_fasta"
+OUT="01_busco_benchmark"
+LINEAGE="$(realpath 01_busco_db/lineages/fabales_odb12.2)"
+CPU_METAEUK=16
+CPU_AUGUSTUS=16
+samples=(
+    "Glycine_max_GCF_000004515.6"
+    "Leucaena_leucocephala_GCA_037074615.1"
+    "Eurypetalum_unijugum_GCA_052075625.1"
+)
+mkdir -p "$OUT"
+for sample in "${samples[@]}"; do
+    genome="${GENOMES}/${sample}.fna"
+    echo "======================================"
+    echo "MetaEuk: $sample"
+    date
+    /usr/bin/time -v \
+    busco \
+        -i "$genome" \
+        -m genome \
+        -l "$LINEAGE" \
+        --metaeuk \
+        --offline \
+        -o "${sample}_metaeuk" \
+        --out_path "$OUT" \
+        -c "$CPU_METAEUK" \
+        2> "${OUT}/${sample}_metaeuk.time.txt"
+done
+
+for sample in "${samples[@]}"; do
+    genome="${GENOMES}/${sample}.fna"
+    echo "======================================"
+    echo "Augustus: $sample"
+    date
+    /usr/bin/time -v \
+    busco \
+        -i "$genome" \
+        -m genome \
+        -l "$LINEAGE" \
+        --augustus \
+        --offline \
+        -o "${sample}_augustus" \
+        --out_path "$OUT" \
+        -c "$CPU_AUGUSTUS" \
+        2> "${OUT}/${sample}_augustus.time.txt"
+done
+
+echo "======================================"
+echo "All benchmark jobs finished."
+date
+
+chmod +x run_busco_benchmark.sh
+nohup ./run_busco_benchmark.sh \
+    > busco_benchmark.log 2>&1 &
+tail -f busco_benchmark.log
