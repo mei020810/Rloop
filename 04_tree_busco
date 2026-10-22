@@ -92,6 +92,12 @@ grep -v $'\tOK$' "$REPORT" | tail -n +2 || true
 chmod +x prepare_genomes.sh
 ./prepare_genomes.sh
 
+在zenodo下载得到Pachyrhizus_erosus更好的基因组，故重命名并替换软链接
+mv \
+00_genomes/unpacked/Pachyrhizus_erosus_zenodo/Pachyrhizus_erosus_zenodo_genomic.fa \
+00_genomes/unpacked/Pachyrhizus_erosus_zenodo/Pachyrhizus_erosus_zenodo_genomic.fna
+./prepare_genomes.sh #重新运行脚本
+
 #BUSCO阶段
 conda activate busco6
 #查询busco和数据库版本
@@ -228,3 +234,475 @@ chmod +x run_busco_benchmark.sh
 nohup ./run_busco_benchmark.sh \
     > busco_benchmark.log 2>&1 &
 tail -f busco_benchmark.log
+#改一下第一次测试的名称
+mv 01_busco_benchmark/Bauhinia_metaeuk \
+   01_busco_benchmark/Bauhinia_variegata_GCA_022379115.2_metaeuk
+mv 01_busco_benchmark/Bauhinia_augustus \
+   01_busco_benchmark/Bauhinia_variegata_GCA_022379115.2_augustus
+mv 01_busco_benchmark/Bauhinia_metaeuk.time.txt \
+   01_busco_benchmark/Bauhinia_variegata_GCA_022379115.2_metaeuk.time.txt
+mv 01_busco_benchmark/Bauhinia_augustus.time.txt \
+   01_busco_benchmark/Bauhinia_variegata_GCA_022379115.2_augustus.time.txt
+#汇总表格
+vim summarize_busco_benchmark.sh
+
+#!/usr/bin/env bash
+set -euo pipefail
+BENCH="01_busco_benchmark"
+OUT="${BENCH}/busco_benchmark_compare.tsv"
+# 提取一个BUSCO结果目录的指标
+get_metrics() {
+    local dir="$1"
+    local timefile="$2"
+    local summary line
+    local C S D F M N SC runtime rss_kb rss_gib
+    summary=$(find "$dir" \
+        -maxdepth 1 \
+        -type f \
+        -name "short_summary.specific.*.txt" \
+        | head -1)
+    if [ -z "$summary" ]; then
+        echo -e "NA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA"
+        return
+    fi
+    line=$(grep -m1 -E 'C:[0-9.]+' "$summary" | tr -d '[:space:]')
+    C=$(echo "$line" | sed -n 's/.*C:\([0-9.]*\)%.*/\1/p')
+    S=$(echo "$line" | sed -n 's/.*S:\([0-9.]*\)%.*/\1/p')
+    D=$(echo "$line" | sed -n 's/.*D:\([0-9.]*\)%.*/\1/p')
+    F=$(echo "$line" | sed -n 's/.*F:\([0-9.]*\)%.*/\1/p')
+    M=$(echo "$line" | sed -n 's/.*M:\([0-9.]*\)%.*/\1/p')
+    N=$(echo "$line" | sed -n 's/.*n:\([0-9]*\).*/\1/p')
+    SC=$(find "$dir" \
+        -type f \
+        -path "*/single_copy_busco_sequences/*.faa" \
+        | wc -l)
+    runtime="NA"
+    rss_gib="NA"
+    if [ -f "$timefile" ]; then
+        runtime=$(grep -m1 "Elapsed (wall clock)" "$timefile" \
+            | awk -F': ' '{print $NF}')
+        rss_kb=$(grep -m1 "Maximum resident set size" "$timefile" \
+            | awk '{print $NF}')
+        if [[ "$rss_kb" =~ ^[0-9]+$ ]]; then
+            rss_gib=$(awk -v kb="$rss_kb" \
+                'BEGIN {printf "%.2f", kb/1024/1024}')
+        fi
+    fi
+    echo -e \
+"${C}\t${S}\t${D}\t${F}\t${M}\t${N}\t${SC}\t${runtime}\t${rss_gib}"
+}
+# 表头
+echo -e \
+"Species\tMeta_C\tMeta_S\tMeta_D\tMeta_F\tMeta_M\tN\tMeta_single\tMeta_time\tMeta_RAM_GiB\tAug_C\tAug_S\tAug_D\tAug_F\tAug_M\tAug_single\tAug_time\tAug_RAM_GiB\tCommon_single\tMeta_only\tAug_only" \
+> "$OUT"
+# 从目录名自动提取所有物种
+mapfile -t species_list < <(
+    find "$BENCH" \
+        -maxdepth 1 \
+        -mindepth 1 \
+        -type d \
+        -printf '%f\n' \
+    | sed -E 's/_(metaeuk|augustus)$//' \
+    | sort -u
+)
+for species in "${species_list[@]}"; do
+    meta_dir="${BENCH}/${species}_metaeuk"
+    aug_dir="${BENCH}/${species}_augustus"
+    meta_time="${BENCH}/${species}_metaeuk.time.txt"
+    aug_time="${BENCH}/${species}_augustus.time.txt"
+    echo "Processing: $species"
+    # 两种结果必须都存在
+    if [ ! -d "$meta_dir" ] || [ ! -d "$aug_dir" ]; then
+        echo "WARNING: missing MetaEuk or Augustus result for $species"
+        continue
+    fi
+    IFS=$'\t' read -r \
+        meta_C meta_S meta_D meta_F meta_M meta_N \
+        meta_SC meta_runtime meta_RAM \
+        <<< "$(get_metrics "$meta_dir" "$meta_time")"
+    IFS=$'\t' read -r \
+        aug_C aug_S aug_D aug_F aug_M aug_N \
+        aug_SC aug_runtime aug_RAM \
+        <<< "$(get_metrics "$aug_dir" "$aug_time")"
+    # 两种方法共同判为single-copy的BUSCO
+    common=$(
+        comm -12 \
+            <(
+                find "$meta_dir" \
+                    -type f \
+                    -path "*/single_copy_busco_sequences/*.faa" \
+                    -exec basename {} .faa \; \
+                    | sort -u
+            ) \
+            <(
+                find "$aug_dir" \
+                    -type f \
+                    -path "*/single_copy_busco_sequences/*.faa" \
+                    -exec basename {} .faa \; \
+                    | sort -u
+            ) \
+        | wc -l
+    )
+    meta_only=$((meta_SC - common))
+    aug_only=$((aug_SC - common))
+    echo -e \
+"${species}\t${meta_C}\t${meta_S}\t${meta_D}\t${meta_F}\t${meta_M}\t${meta_N}\t${meta_SC}\t${meta_runtime}\t${meta_RAM}\t${aug_C}\t${aug_S}\t${aug_D}\t${aug_F}\t${aug_M}\t${aug_SC}\t${aug_runtime}\t${aug_RAM}\t${common}\t${meta_only}\t${aug_only}" \
+    >> "$OUT"
+done
+echo
+echo "Finished."
+echo "Output: $OUT"
+
+chmod +x summarize_busco_benchmark.sh
+./summarize_busco_benchmark.sh
+#查看
+column -t -s $'\t' \
+01_busco_benchmark/busco_benchmark_compare.tsv
+
+##老师说用helixer注释基因组得到gff3，然后再用orthofinder来建进化树。##以上busco就当白做了吧
+
+#建立独立环境，下载helixer及其依赖包和数据库
+conda create -n helixer python=3.10 -y
+conda activate helixer
+cd ~
+git clone https://github.com/usadellab/Helixer.git
+cd Helixer
+#记录版本
+git describe --tags --always > ../helixer_version.txt
+git rev-parse HEAD > ../helixer_version.txt
+#安装python依赖
+pip install --upgrade pip
+pip install wheel
+pip install -r requirements.3.10.txt
+pip install . #读取当前目录的项目配置文件，并将此项目安装进当前python环境中
+which Helixer.py
+Helixer.py --help | head
+#安装HelixerPost
+conda install -c conda-forge rust hdf5 pkg-config -y
+rustc --version
+cargo --version
+h5cc -showconfig | head
+cd ~/software
+git clone https://github.com/usadellab/HelixerPost.git
+cd HelixerPost
+export HDF5_DIR="$CONDA_PREFIX"
+echo "$HDF5_DIR"
+cargo build --release
+#hdf5版本过高系统无法识别，重新下载兼容的版本
+mamba install -n helixer \
+  --override-channels \
+  -c conda-forge \
+  "hdf5=1.14.*"
+conda list | grep -i hdf5
+#重新编译
+cargo clean
+cargo build --release
+ls -lh target/release/helixer_post_bin
+#测试
+./target/release/helixer_post_bin
+#放进当前环境中
+cp target/release/helixer_post_bin "$CONDA_PREFIX/bin/"
+which helixer_post_bin
+helixer_post_bin
+#依赖检测
+cd ~/software/Helixer/helixer
+pytest --verbose tests/test_imports.py
+pytest --verbose tests/test_helixer.py
+#固定TensorFlow 2.15.1
+python -m pip install --upgrade "tensorflow[and-cuda]==2.15.1"
+pip install tensorflow[and-cuda]
+python -m pip list | grep -E 'tensorflow|nvidia|cuda|cudnn'
+python -m pip check
+python -c "import tensorflow as tf; print('TF:', tf.__version__); print('GPU:', tf.config.list_physical_devices('GPU'))"
+#测试
+python - <<'PY'
+import tensorflow as tf
+print("TensorFlow:", tf.__version__)
+print("GPUs:", tf.config.list_physical_devices("GPU"))
+with tf.device("/GPU:0"):
+    a = tf.random.normal([4000, 4000])
+    b = tf.random.normal([4000, 4000])
+    c = tf.matmul(a, b)
+print("Result shape:", c.shape)
+print("Device:", c.device)
+PY
+#检查Helixer完整性
+cd ~/software/Helixer/helixer
+pytest --verbose tests/test_imports.py
+helixer_post_bin
+#下载植物模型
+cd ~/software/Helixer
+scripts/fetch_helixer_models.py --lineage land_plant
+#网络太差，用断点续传
+mkdir -p ~/.local/share/Helixer/models/land_plant
+cd ~/.local/share/Helixer/models/land_plant
+wget -c \
+  --tries=0 \
+  --timeout=60 \
+  'https://zenodo.org/records/10836346/files/land_plant_v0.3_a_0080.h5?download=1' \
+  -O land_plant_v0.3_a_0080.h5
+cd ~/.local/share/Helixer/models
+wget -c \
+  'https://raw.githubusercontent.com/weberlab-hhu/Helixer/main/resources/model_list.csv' \
+  -O model_list.csv
+find ~/.local/share/Helixer/models -type f -ls
+#测试HD5文件是否完整可读
+python - <<'PY'
+import h5py
+p = "/home/mshe/.local/share/Helixer/models/land_plant/land_plant_v0.3_a_0080.h5"
+with h5py.File(p, "r") as f:
+    print("HDF5 file opened successfully")
+    print(list(f.keys())[:20])
+PY
+
+#用Bauhinia进行测试
+cd /data/mshe/deepRloopPro_data/legume_phylogeny
+mkdir -p 02_helixer_test
+Helixer.py \
+  --lineage land_plant \
+  --fasta-path 00_genomes/genomes_fasta/Bauhinia_variegata_GCA_022379115.2.fna \
+  --species Bauhinia_variegata \
+  --gff-output-path 02_helixer_test/Bauhinia_variegata_GCA_022379115.2.helixer.gff3
+#检查数据行列数（无输出为正常）
+awk -F'\t' '
+!/^#/ && NF != 9 {
+    print "Bad line:", NR, "fields:", NF
+    print $0
+}
+' 02_helixer_test/Bauhinia_variegata_GCA_022379115.2.helixer.gff3 | head
+#检查feature type（mRNA与gene数量一般为1：1）
+grep -v '^#' \
+02_helixer_test/Bauhinia_variegata_GCA_022379115.2.helixer.gff3 \
+| cut -f3 | sort | uniq -c | sort -nr
+#GFF3中有咩有genome中不存在的序列（无输出为正常）
+GFF=02_helixer_test/Bauhinia_variegata_GCA_022379115.2.helixer.gff3
+FA=00_genomes/genomes_fasta/Bauhinia_variegata_GCA_022379115.2.fna
+grep '^>' "$FA" \
+| sed 's/^>//; s/ .*//' \
+| sort -u > genome.seqids
+awk '!/^#/ {print $1}' 02_helixer_test/Bauhinia_variegata_GCA_022379115.2.helixer.gff3 \
+| sort -u > gff.seqids
+comm -23 gff.seqids genome.seqids
+#检查坐标（无输出为正常）
+awk -F'\t' '
+!/^#/ && ($4 < 1 || $5 < $4) {
+    print NR,$0
+}' "$GFF" | head
+#AGAT可用于检查、标准化和修复GFF的层级关系
+conda create -n agat -c conda-forge -c bioconda agat -y
+conda activate agat
+#统计gene model、isoform、exon等结构信息（若agat能正常解析，没有parent/ID/结构错误即可,unkonwn=0）
+agat_sp_statistics.pl \
+  --gff "$GFF" \
+  --gs "$FA" \
+  -o Bauhinia.helixer.agat_stats.txt
+
+#将gff3转换成蛋白（在agat环境里）
+conda install -c bioconda gffread -y
+mkdir -p 02_helixer_test/sequences
+#提取 transcript
+gffread "$GFF" \
+  -g "$FA" \
+  -w 02_helixer_test/sequences/Bauhinia.transcripts.fa
+#提取 CDS
+gffread "$GFF" \
+  -g "$FA" \
+  -x 02_helixer_test/sequences/Bauhinia.cds.fa
+#提取 protein
+gffread "$GFF" \
+  -g "$FA" \
+  -y 02_helixer_test/sequences/Bauhinia.proteins.fa
+#若gffread三种序列正常导出并数量一致，没有protein丢失
+seqkit stats 02_helixer_test/sequences/Bauhinia.*.fa
+#检查蛋白数（理论上与mRNA数类似）
+grep -c '^>' \
+02_helixer_test/sequences/Bauhinia.proteins.fa
+#检查异常蛋白
+seqkit fx2tab -n -l \
+02_helixer_test/sequences/Bauhinia.proteins.fa \
+| sort -k2,2n \
+| head
+#检查极短蛋白（无输出即无明显的大量内部终止密码子问题）
+grep -v '^>' \
+02_helixer_test/sequences/Bauhinia.proteins.fa \
+| grep '\*' | head
+#busco QC
+conda activate busco6
+busco \
+  -i 02_helixer_test/sequences/Bauhinia.proteins.fa \
+  -m proteins \
+  -l /data/mshe/deepRloopPro_data/legume_phylogeny/01_busco_db/lineages/fabales_odb12.2 \
+  --offline \
+  -o Bauhinia_Helixer_protein \
+  --out_path 02_helixer_test/busco_protein \
+  -c 16
+cat 02_helixer_test/busco_protein/Bauhinia_Helixer_protein/short_summary.specific.*.txt
+
+#用Eurypetalum再跑一遍，看看装配级别较低的基因组想过如何
+tmux new -s eurypetalum_helixer
+conda activate helixer
+cd /data/mshe/deepRloopPro_data/legume_phylogeny
+Helixer.py \
+  --lineage land_plant \
+  --fasta-path 00_genomes/genomes_fasta/Eurypetalum_unijugum_GCA_052075625.1.fna \
+  --species Eurypetalum_unijugum \
+  --gff-output-path 02_helixer_test/Eurypetalum_unijugum_GCA_052075625.1.helixer.gff3 \
+  > 02_helixer_test/Eurypetalum_unijugum.helixer.log 2>&1
+#检查
+awk -F'\t' '
+!/^#/ && NF != 9 {
+    print "Bad line:", NR, "fields:", NF
+    print $0
+}
+' 02_helixer_test/Eurypetalum_unijugum_GCA_052075625.1.helixer.gff3 | head
+grep -v '^#' 02_helixer_test/Eurypetalum_unijugum_GCA_052075625.1.helixer.gff3 \
+| cut -f3 | sort | uniq -c | sort -nr
+GFF=02_helixer_test/Eurypetalum_unijugum_GCA_052075625.1.helixer.gff3
+FA=00_genomes/genomes_fasta/Eurypetalum_unijugum_GCA_052075625.1.fna
+grep '^>' "$FA" \
+| sed 's/^>//; s/ .*//' \
+| sort -u > E_genome.seqids
+awk '!/^#/ {print $1}' "$GFF" \
+| sort -u > E_gff.seqids
+comm -23 E_gff.seqids E_genome.seqids
+awk -F'\t' '
+!/^#/ && ($4 < 1 || $5 < $4) {
+    print NR,$0
+}' "$GFF" | head
+conda activate agat
+agat_sp_statistics.pl \
+  --gff "$GFF" \
+  --gs "$FA" \
+  -o Eurypetalum.helixer.agat_stats.txt
+gffread "$GFF" \
+  -g "$FA" \
+  -w 02_helixer_test/sequences/Eurypetalum.transcripts.fa
+gffread "$GFF" \
+  -g "$FA" \
+  -x 02_helixer_test/sequences/Eurypetalum.cds.fa
+gffread "$GFF" \
+  -g "$FA" \
+  -y 02_helixer_test/sequences/Eurypetalum.proteins.fa
+seqkit stats 02_helixer_test/sequences/Eurypetalum.*.fa
+grep -c '^>' \
+02_helixer_test/sequences/Eurypetalum.proteins.fa
+seqkit fx2tab -n -l \
+02_helixer_test/sequences/Eurypetalum.proteins.fa \
+| sort -k2,2n \
+| head
+grep -v '^>' \
+02_helixer_test/sequences/Eurypetalum.proteins.fa \
+| grep '\*' | head
+conda activate busco6
+busco \
+  -i 02_helixer_test/sequences/Eurypetalum.proteins.fa \
+  -m proteins \
+  -l /data/mshe/deepRloopPro_data/legume_phylogeny/01_busco_db/lineages/fabales_odb12.2 \
+  --offline \
+  -o Eurypetalum_Helixer_protein \
+  --out_path 02_helixer_test/busco_protein \
+  -c 16
+cat 02_helixer_test/busco_protein/Eurypetalum_Helixer_protein/short_summary.specific.*.txt
+
+#批量操作脚本
+# Helixer 获取gff
+vim run_helixer.sh
+
+#!/usr/bin/env bash
+set -euo pipefail
+sample="$1"
+fasta="$2"
+species=$(echo "$sample" | cut -d_ -f1-2)
+
+OUTDIR="02_helixer"
+GFF="${OUTDIR}/gff3/${sample}.helixer.gff3"
+LOG="${OUTDIR}/logs/${sample}.helixer.log"
+DONE="${OUTDIR}/gff3/${sample}.done"
+mkdir -p "${OUTDIR}/gff3" "${OUTDIR}/logs"
+
+# 已经成功跑过就跳过
+if [ -f "$DONE" ]; then
+    echo "[SKIP] $sample"
+    exit 0
+fi
+
+# 删除上一次可能中断留下的不完整结果
+rm -f "$GFF"
+echo "[START] $sample"
+
+Helixer.py \
+    --lineage land_plant \
+    --fasta-path "$fasta" \
+    --species "$species" \
+    --gff-output-path "$GFF" \
+    > "$LOG" 2>&1
+
+touch "$DONE"
+echo "[OK] $sample"
+
+chmod +x run_helixer.sh
+
+tmux new -s helixer_batch
+conda activate helixer
+cd /data/mshe/deepRloopPro_data/legume_phylogeny
+GENOME_DIR="00_genomes/genomes_fasta"
+FAILED="02_helixer/failed_samples.txt"
+mkdir -p 02_helixer
+> "$FAILED"
+
+for fasta in "$GENOME_DIR"/*.fna; do
+    sample=$(basename "$fasta" .fna)
+    echo "========================================"
+    echo "Processing: $sample"
+    if ./run_helixer.sh "$sample" "$fasta"; then
+        echo "[DONE] $sample"
+    else
+        echo "[FAILED] $sample"
+        echo "$sample" >> "$FAILED"
+    fi
+done
+echo "========================================"
+echo "All genomes processed."
+if [ -s "$FAILED" ]; then
+    echo "Failed samples:"
+    cat "$FAILED"
+else
+    echo "No failed samples."
+fi
+
+vim run_helixer.sh
+#!/usr/bin/env bash
+set -euo pipefail
+sample="$1"
+fasta="$2"
+species=$(echo "$sample" | cut -d_ -f1-2)
+
+OUTDIR="02_helixer"
+GFF="${OUTDIR}/gff3/${sample}.helixer.gff3"
+LOG="${OUTDIR}/logs/${sample}.helixer.log"
+DONE="${OUTDIR}/gff3/${sample}.done"
+TMPDIR="${OUTDIR}/tmp"
+mkdir -p "${OUTDIR}/gff3" "${OUTDIR}/logs" "$TMPDIR"
+
+# 已经成功跑过就跳过
+if [ -f "$DONE" ]; then
+    echo "[SKIP] $sample"
+    exit 0
+fi
+
+# 删除上一次可能中断留下的不完整结果
+rm -f "$GFF"
+echo "[START] $sample"
+
+Helixer.py \
+    --lineage land_plant \
+    --fasta-path "$fasta" \
+    --species "$species" \
+    --temporary-dir "$TMPDIR" \
+    --gff-output-path "$GFF" \
+    > "$LOG" 2>&1
+
+touch "$DONE"
+echo "[OK] $sample"
+
+tmux attach -t helixer_batch
