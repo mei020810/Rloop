@@ -52,3 +52,102 @@ echo "[ALL DONE] $(date '+%F %T')"
 chmod +x run_deepRloop_A_rev.sh
 nohup /data/mshe/deepRloopPro_data/run_deepRloop_A_rev.sh > /data/mshe/deepRloopPro_data/run_deepRloop_A_rev.master.log 2>&1 &
 
+cp make_genedata_rloop_summary.sh make_genedata_rloop_summary_rev.sh
+vim make_genedata_rloop_summary_rev.sh
+###修改位置
+BED_DIR="deepRloop_results_A_rev"
+OUT="genedata_rloop_summary_rev.tsv"
+for bed in $(ls "${BED_DIR}"/*_rev_final_predict.bed 2>/dev/null | sort)
+prefix=$(basename "$bed" _rev_final_predict.bed)
+###
+bash make_genedata_rloop_summary_rev.sh
+
+vim compare_fwd_rev.R
+library(tidyverse)
+
+fwd_file <- "/data/mshe/deepRloopPro_data/genedata_rloop_summary.tsv"
+rev_file <- "/data/mshe/deepRloopPro_data/genedata_rloop_summary_rev.tsv"
+
+outdir <- "/data/mshe/deepRloopPro_data/fwd_rev_compare"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+fwd <- read_tsv(fwd_file, show_col_types = FALSE)
+rev <- read_tsv(rev_file, show_col_types = FALSE)
+
+# 只保留比较需要的列
+fwd2 <- fwd %>%
+  select(
+    species,
+    subfamily,
+    major_branch,
+    Rloop_region_number,
+    Rloop_mean_length,
+    Rloop_density_per_100Mb,
+    Rloop_merged_coverage_ratio
+  ) %>%
+  rename(
+    fwd_n = Rloop_region_number,
+    fwd_mean_length = Rloop_mean_length,
+    fwd_density = Rloop_density_per_100Mb,
+    fwd_coverage = Rloop_merged_coverage_ratio
+  )
+
+rev2 <- rev %>%
+  select(
+    species,
+    Rloop_region_number,
+    Rloop_mean_length,
+    Rloop_density_per_100Mb,
+    Rloop_merged_coverage_ratio
+  ) %>%
+  rename(
+    rev_n = Rloop_region_number,
+    rev_mean_length = Rloop_mean_length,
+    rev_density = Rloop_density_per_100Mb,
+    rev_coverage = Rloop_merged_coverage_ratio
+  )
+
+cmp <- fwd2 %>%
+  inner_join(rev2, by = "species") %>%
+  mutate(
+    # rev / fwd
+    n_ratio = rev_n / fwd_n,
+    density_ratio = rev_density / fwd_density,
+    mean_length_ratio = rev_mean_length / fwd_mean_length,
+    coverage_ratio = rev_coverage / fwd_coverage,
+
+    # 对称表示：0 = 完全相同；>0 rev高；<0 fwd高
+    log2_n_ratio = log2(n_ratio),
+    log2_density_ratio = log2(density_ratio),
+    log2_mean_length_ratio = log2(mean_length_ratio),
+    log2_coverage_ratio = log2(coverage_ratio),
+
+    # 绝对差
+    n_diff = rev_n - fwd_n,
+    density_diff = rev_density - fwd_density,
+    mean_length_diff = rev_mean_length - fwd_mean_length,
+    coverage_diff = rev_coverage - fwd_coverage
+  )
+
+write_tsv(
+  cmp,
+  file.path(outdir, "fwd_vs_rev_summary.tsv")
+)
+
+print(
+  cmp %>%
+    select(
+      species,
+      fwd_n, rev_n,
+      fwd_density, rev_density,
+      fwd_mean_length, rev_mean_length,
+      fwd_coverage, rev_coverage,
+      log2_coverage_ratio
+    ),
+  n = Inf
+)
+conda activate tidyverse
+Rscript compare_fwd_rev.R
+column -t -s $'\t' \
+/data/mshe/deepRloopPro_data/fwd_rev_compare/fwd_vs_rev_summary.tsv \
+| less -S
