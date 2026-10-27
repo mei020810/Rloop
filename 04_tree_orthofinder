@@ -538,7 +538,7 @@ busco \
   -c 16
 cat 02_helixer_test/busco_protein/Bauhinia_Helixer_protein/short_summary.specific.*.txt
 
-#用Eurypetalum再跑一遍，看看装配级别较低的基因组想过如何
+#用Eurypetalum再跑一遍，看看装配级别较低的基因组如何
 tmux new -s eurypetalum_helixer
 conda activate helixer
 cd /data/mshe/deepRloopPro_data/legume_phylogeny
@@ -669,7 +669,7 @@ if [ -s "$FAILED" ]; then
 else
     echo "No failed samples."
 fi
-
+#有两个物种没跑成功，改一下脚本继续跑
 vim run_helixer.sh
 #!/usr/bin/env bash
 set -euo pipefail
@@ -706,3 +706,154 @@ touch "$DONE"
 echo "[OK] $sample"
 
 tmux attach -t helixer_batch
+GENOME_DIR="00_genomes/genomes_fasta"
+FAILED="02_helixer/failed_samples.txt"
+
+> "$FAILED"
+
+for fasta in "$GENOME_DIR"/*.fna; do
+
+    sample=$(basename "$fasta" .fna)
+
+    echo "========================================"
+    echo "Processing: $sample"
+
+    if ./run_helixer.sh "$sample" "$fasta"; then
+        echo "[DONE] $sample"
+    else
+        echo "[FAILED] $sample"
+        echo "$sample" >> "$FAILED"
+    fi
+
+done
+
+ls 02_helixer/gff3/*.done | wc -l
+#转换为transcript/CDS/protein
+mkdir -p 03_proteomes/{transcript,cds,protein,logs}
+conda activate agat
+GENOME_DIR="00_genomes/genomes_fasta"
+GFF_DIR="02_helixer/gff3"
+
+for gff in "$GFF_DIR"/*.helixer.gff3; do
+
+    sample=$(basename "$gff" .helixer.gff3)
+    fasta="${GENOME_DIR}/${sample}.fna"
+
+    echo "========================================"
+    echo "Processing: $sample"
+
+    gffread "$gff" \
+        -g "$fasta" \
+        -w "03_proteomes/transcript/${sample}.transcript.fa" \
+        -x "03_proteomes/cds/${sample}.cds.fa" \
+        -y "03_proteomes/protein/${sample}.protein.fa" \
+        2> "03_proteomes/logs/${sample}.gffread.log"
+
+    echo "[OK] $sample"
+
+done
+ls 03_proteomes/protein/*.protein.fa | wc -l
+ls 03_proteomes/cds/*.cds.fa | wc -l
+ls 03_proteomes/transcript/*.transcript.fa | wc -l
+#检查异常蛋白
+seqkit stats -T \
+    03_proteomes/protein/*.protein.fa \
+    > 03_proteomes/protein_stats.tsv
+column -t 03_proteomes/protein_stats.tsv | less -S
+#检查出 Mimosa 的蛋白转换异常（值为0）
+GFF=02_helixer/gff3/Mimosa_bimucronata_GWHDODZ00000000.helixer.gff3
+grep -v '^#' "$GFF" \
+| cut -f3 | sort | uniq -c | sort -nr
+head 03_proteomes/logs/Mimosa_bimucronata_GWHDODZ00000000.gffread.log
+awk '!/^#/ {print $1; exit}' "$GFF"
+grep '^>' \
+00_genomes/genomes_fasta/Mimosa_bimucronata_GWHDODZ00000000.fna \
+| head
+#是因为fna格式问题，故修改
+mkdir -p 00_genomes/cleaned_fasta
+awk '
+/^>/ {
+    sub(/[[:space:]].*/, "", $0)
+}
+{print}
+' \
+00_genomes/genomes_fasta/Mimosa_bimucronata_GWHDODZ00000000.fna \
+> 00_genomes/cleaned_fasta/Mimosa_bimucronata_GWHDODZ00000000.fna
+grep '^>' \
+00_genomes/cleaned_fasta/Mimosa_bimucronata_GWHDODZ00000000.fna | head
+ln -sfn \
+"$(realpath 00_genomes/cleaned_fasta/Mimosa_bimucronata_GWHDODZ00000000.fna)" \
+00_genomes/genomes_fasta/Mimosa_bimucronata_GWHDODZ00000000.fna
+rm -f \
+02_helixer/gff3/Mimosa_bimucronata_GWHDODZ00000000.helixer.gff3 \
+02_helixer/gff3/Mimosa_bimucronata_GWHDODZ00000000.done
+#重跑
+conda activate helixer
+./run_helixer.sh \
+Mimosa_bimucronata_GWHDODZ00000000 \
+00_genomes/genomes_fasta/Mimosa_bimucronata_GWHDODZ00000000.fna
+sample="Mimosa_bimucronata_GWHDODZ00000000"
+
+rm -f \
+03_proteomes/protein/${sample}.protein.fa \
+03_proteomes/cds/${sample}.cds.fa \
+03_proteomes/transcript/${sample}.transcript.fa
+gffread \
+02_helixer/gff3/${sample}.helixer.gff3 \
+-g 00_genomes/genomes_fasta/${sample}.fna \
+-w 03_proteomes/transcript/${sample}.transcript.fa \
+-x 03_proteomes/cds/${sample}.cds.fa \
+-y 03_proteomes/protein/${sample}.protein.fa \
+2> 03_proteomes/logs/${sample}.gffread.log
+#得到蛋白数量应接近基因数量
+seqkit stats \
+03_proteomes/protein/${sample}.protein.fa \
+03_proteomes/cds/${sample}.cds.fa \
+03_proteomes/transcript/${sample}.transcript.fa
+
+# busco6
+tmux attach -t helixer_batch
+mkdir -p 04_busco_protein/logs
+conda activate busco6
+#试验
+busco \
+  -i 03_proteomes/protein/Hoita_strobilina_GCA_054297685.1.protein.fa \
+  -m proteins \
+  -l 01_busco_db/lineages/fabales_odb12.2 \
+  --offline \
+  -o Hoita_strobilina_GCA_054297685.1 \
+  --out_path 04_busco_protein \
+  -c 16
+#结束后看结果
+cat 04_busco_protein/Hoita_strobilina_GCA_054297685.1/short_summary*.txt
+
+#批量跑
+PROTEIN_DIR="03_proteomes/protein"
+OUTDIR="04_busco_protein"
+LINEAGE="/data/mshe/deepRloopPro_data/legume_phylogeny/01_busco_db/lineages/fabales_odb12.2"
+
+for protein in "$PROTEIN_DIR"/*.protein.fa; do
+    sample=$(basename "$protein" .protein.fa)
+    donefile="${OUTDIR}/${sample}.done"
+    echo "========================================"
+    echo "Processing: $sample"
+    if [ -f "$donefile" ]; then
+        echo "[SKIP] $sample"
+        continue
+    fi
+    if busco \
+        -i "$protein" \
+        -m proteins \
+        -l "$LINEAGE" \
+        --offline \
+        -o "$sample" \
+        --out_path "$OUTDIR" \
+        -c 16 \
+        > "${OUTDIR}/logs/${sample}.busco.log" 2>&1
+    then
+        touch "$donefile"
+        echo "[OK] $sample"
+    else
+        echo "[FAILED] $sample"
+    fi
+done
