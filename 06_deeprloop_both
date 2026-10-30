@@ -1,1 +1,7 @@
-
+#输出both的数据汇总表
+cp make_genedata_rloop_summary.sh \
+   make_genedata_rloop_summary_both.sh
+vim make_genedata_rloop_summary_both.sh
+###需要改的代码如下
+BED_DIR="deepRloop_results_A_both"
+OUT="genedata_rloop_summary_both.tsv"
