@@ -1,0 +1,320 @@
+# deepRloopPre 默认使用--strand fwd 得到的 peak 均为 + 链上的，现需要补做--strand rev 得到-链的rloop
+
+vim run_deepRloop_A_rev.sh
+#!/usr/bin/env bash
+set -euo pipefail
+MODEL=/home/mshe/deepRloop_models/transfer_scale128_single_13_0.29202.hdf5
+RUNLIST=/data/mshe/deepRloopPro_data/new_list_A.tsv
+OUTDIR=/data/mshe/deepRloopPro_data/deepRloop_results_A_rev
+LOGDIR=/data/mshe/deepRloopPro_data/deepRloop_logs_A_rev
+MAXJOBS=8
+mkdir -p "$OUTDIR" "$LOGDIR"
+while IFS=$'\t' read -r PREFIX FASTA CHROMSIZE FAI
+do
+    RUN_PREFIX="${PREFIX}_rev"
+    FINALBED="${OUTDIR}/${RUN_PREFIX}_final_predict.bed"
+    LOGFILE="${LOGDIR}/${RUN_PREFIX}.log"
+    # 已经跑完：跳过
+    if [[ -s "$FINALBED" ]]; then
+        echo "[SKIP DONE] $RUN_PREFIX"
+        continue
+    fi
+    # 已经在跑：跳过
+    if pgrep -af "deepRloopPredict.py" \
+        | grep -Fq -- "--prefix ${RUN_PREFIX}"
+    then
+        echo "[SKIP RUNNING] $RUN_PREFIX"
+        continue
+    fi
+    # 控制并行任务数
+    while [[ "$(jobs -pr | wc -l)" -ge "$MAXJOBS" ]]; do
+        sleep 30
+    done
+    (
+        cd "$OUTDIR"
+        echo "[START] $(date '+%F %T') $RUN_PREFIX"
+        deepRloopPredict.py \
+          --h5 "$MODEL" \
+          --fasta "$FASTA" \
+          --chromsize "$CHROMSIZE" \
+          --prefix "$RUN_PREFIX" \
+          --strand rev \
+          > "$LOGFILE" 2>&1
+        if [[ ! -s "$FINALBED" ]]; then
+            echo "[ERROR] expected output not generated: $FINALBED" >&2
+            exit 1
+        fi
+        echo "[DONE] $(date '+%F %T') $RUN_PREFIX"
+    ) &
+done < "$RUNLIST"
+wait
+echo "[ALL DONE] $(date '+%F %T')"
+chmod +x run_deepRloop_A_rev.sh
+nohup /data/mshe/deepRloopPro_data/run_deepRloop_A_rev.sh > /data/mshe/deepRloopPro_data/run_deepRloop_A_rev.master.log 2>&1 &
+
+cp make_genedata_rloop_summary.sh make_genedata_rloop_summary_rev.sh
+vim make_genedata_rloop_summary_rev.sh
+###修改位置
+BED_DIR="deepRloop_results_A_rev"
+OUT="genedata_rloop_summary_rev.tsv"
+for bed in $(ls "${BED_DIR}"/*_rev_final_predict.bed 2>/dev/null | sort)
+prefix=$(basename "$bed" _rev_final_predict.bed)
+###
+bash make_genedata_rloop_summary_rev.sh
+
+vim compare_fwd_rev.R
+library(tidyverse)
+
+fwd_file <- "/data/mshe/deepRloopPro_data/genedata_rloop_summary.tsv"
+rev_file <- "/data/mshe/deepRloopPro_data/genedata_rloop_summary_rev.tsv"
+
+outdir <- "/data/mshe/deepRloopPro_data/fwd_rev_compare"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+fwd <- read_tsv(fwd_file, show_col_types = FALSE)
+rev <- read_tsv(rev_file, show_col_types = FALSE)
+
+# 只保留比较需要的列
+fwd2 <- fwd %>%
+  select(
+    species,
+    subfamily,
+    major_branch,
+    Rloop_region_number,
+    Rloop_mean_length,
+    Rloop_density_per_100Mb,
+    Rloop_merged_coverage_ratio
+  ) %>%
+  rename(
+    fwd_n = Rloop_region_number,
+    fwd_mean_length = Rloop_mean_length,
+    fwd_density = Rloop_density_per_100Mb,
+    fwd_coverage = Rloop_merged_coverage_ratio
+  )
+
+rev2 <- rev %>%
+  select(
+    species,
+    Rloop_region_number,
+    Rloop_mean_length,
+    Rloop_density_per_100Mb,
+    Rloop_merged_coverage_ratio
+  ) %>%
+  rename(
+    rev_n = Rloop_region_number,
+    rev_mean_length = Rloop_mean_length,
+    rev_density = Rloop_density_per_100Mb,
+    rev_coverage = Rloop_merged_coverage_ratio
+  )
+
+cmp <- fwd2 %>%
+  inner_join(rev2, by = "species") %>%
+  mutate(
+    # rev / fwd
+    n_ratio = rev_n / fwd_n,
+    density_ratio = rev_density / fwd_density,
+    mean_length_ratio = rev_mean_length / fwd_mean_length,
+    coverage_ratio = rev_coverage / fwd_coverage,
+
+    # 对称表示：0 = 完全相同；>0 rev高；<0 fwd高
+    log2_n_ratio = log2(n_ratio),
+    log2_density_ratio = log2(density_ratio),
+    log2_mean_length_ratio = log2(mean_length_ratio),
+    log2_coverage_ratio = log2(coverage_ratio),
+
+    # 绝对差
+    n_diff = rev_n - fwd_n,
+    density_diff = rev_density - fwd_density,
+    mean_length_diff = rev_mean_length - fwd_mean_length,
+    coverage_diff = rev_coverage - fwd_coverage
+  )
+
+write_tsv(
+  cmp,
+  file.path(outdir, "fwd_vs_rev_summary.tsv")
+)
+
+print(
+  cmp %>%
+    select(
+      species,
+      fwd_n, rev_n,
+      fwd_density, rev_density,
+      fwd_mean_length, rev_mean_length,
+      fwd_coverage, rev_coverage,
+      log2_coverage_ratio
+    ),
+  n = Inf
+)
+conda activate tidyverse
+Rscript compare_fwd_rev.R
+column -t -s $'\t' \
+/data/mshe/deepRloopPro_data/fwd_rev_compare/fwd_vs_rev_summary.tsv \
+| less -S
+
+#生成both（保留链特异性的数据）+union（正反链坐标取并集）+统计fwd/rev的空间重叠程度
+vim build_both_union_overlap.sh
+
+#!/usr/bin/env bash
+set -euo pipefail
+RUNLIST=/data/mshe/deepRloopPro_data/new_list_A.tsv
+FWDDIR=/data/mshe/deepRloopPro_data/deepRloop_results_A
+REVDIR=/data/mshe/deepRloopPro_data/deepRloop_results_A_rev
+BOTHDIR=/data/mshe/deepRloopPro_data/deepRloop_results_A_both
+UNIONDIR=/data/mshe/deepRloopPro_data/deepRloop_results_A_union
+OUTDIR=/data/mshe/deepRloopPro_data/fwd_rev_overlap
+mkdir -p "$BOTHDIR" "$UNIONDIR" "$OUTDIR"
+SUMMARY="$OUTDIR/fwd_rev_overlap_summary.tsv"
+
+echo -e \
+"species\tfwd_n\trev_n\tboth_n\tfwd_overlap_n\tfwd_overlap_frac\trev_overlap_n\trev_overlap_frac\tjaccard\tintersection_bp\tunion_bp" \
+> "$SUMMARY"
+
+while IFS=$'\t' read -r sp fasta chrom fai
+do
+    [[ -z "${sp:-}" ]] && continue
+
+    echo "=================================================="
+    echo "[INFO] $sp"
+
+    fwd="$FWDDIR/${sp}_final_predict.bed"
+    rev="$REVDIR/${sp}_rev_final_predict.bed"
+
+    both="$BOTHDIR/${sp}_final_predict.bed"
+    union="$UNIONDIR/${sp}_total_rloop_union.bed"
+
+    if [[ ! -s "$fwd" ]]; then
+        echo "[WARN] missing fwd: $fwd" >&2
+        continue
+    fi
+
+    if [[ ! -s "$rev" ]]; then
+        echo "[WARN] missing rev: $rev" >&2
+        continue
+    fi
+
+    if [[ ! -s "$chrom" ]]; then
+        echo "[WARN] missing chromsize: $chrom" >&2
+        continue
+    fi
+
+    # --------------------------------------------------------
+    # 1. 简单strand QC
+    # --------------------------------------------------------
+    fwd_bad=$(awk '$0 !~ /^#/ && $6 != "+" {n++} END{print n+0}' "$fwd")
+    rev_bad=$(awk '$0 !~ /^#/ && $6 != "-" {n++} END{print n+0}' "$rev")
+
+    if [[ "$fwd_bad" -ne 0 ]]; then
+        echo "[WARN] $sp fwd contains $fwd_bad non-+ records" >&2
+    fi
+
+    if [[ "$rev_bad" -ne 0 ]]; then
+        echo "[WARN] $sp rev contains $rev_bad non-- records" >&2
+    fi
+
+    # --------------------------------------------------------
+    # 2. both strands
+    # 保留+/-信息，不merge
+    # --------------------------------------------------------
+    cat "$fwd" "$rev" \
+      | bedtools sort -g "$chrom" -i - \
+      > "$both"
+
+    # --------------------------------------------------------
+    # 3. total R-loop coordinate union
+    # 不考虑strand，对所有坐标取并集
+    # --------------------------------------------------------
+    cut -f1-3 "$both" \
+      | bedtools sort -g "$chrom" -i - \
+      | bedtools merge -i - \
+      > "$union"
+
+    # --------------------------------------------------------
+    # 4. peak-level overlap
+    # fwd有多少peak与任意rev peak重叠
+    # rev同理
+    # --------------------------------------------------------
+    fwd_n=$(wc -l < "$fwd")
+    rev_n=$(wc -l < "$rev")
+    both_n=$(wc -l < "$both")
+
+    fwd_overlap_n=$(
+        bedtools intersect -u -a "$fwd" -b "$rev" \
+        | wc -l
+    )
+
+    rev_overlap_n=$(
+        bedtools intersect -u -a "$rev" -b "$fwd" \
+        | wc -l
+    )
+
+    fwd_overlap_frac=$(
+        awk -v x="$fwd_overlap_n" -v n="$fwd_n" \
+        'BEGIN{
+            if(n>0) printf "%.6f", x/n;
+            else print "NA"
+        }'
+    )
+
+    rev_overlap_frac=$(
+        awk -v x="$rev_overlap_n" -v n="$rev_n" \
+        'BEGIN{
+            if(n>0) printf "%.6f", x/n;
+            else print "NA"
+        }'
+    )
+
+    # --------------------------------------------------------
+    # 5. bp-level overlap: bedtools jaccard
+    #
+    # 先各自在strand内部merge，避免单侧自身重叠影响结果
+    # --------------------------------------------------------
+    fwd_tmp="$OUTDIR/${sp}.fwd.merged.tmp.bed"
+    rev_tmp="$OUTDIR/${sp}.rev.merged.tmp.bed"
+
+    cut -f1-3 "$fwd" \
+      | bedtools sort -g "$chrom" -i - \
+      | bedtools merge -i - \
+      > "$fwd_tmp"
+
+    cut -f1-3 "$rev" \
+      | bedtools sort -g "$chrom" -i - \
+      | bedtools merge -i - \
+      > "$rev_tmp"
+
+    read -r intersection_bp union_bp jaccard n_intersections < <(
+        bedtools jaccard \
+          -a "$fwd_tmp" \
+          -b "$rev_tmp" \
+        | awk 'NR==2 {print $1,$2,$3,$4}'
+    )
+
+    rm -f "$fwd_tmp" "$rev_tmp"
+
+    echo -e \
+"${sp}\t${fwd_n}\t${rev_n}\t${both_n}\t${fwd_overlap_n}\t${fwd_overlap_frac}\t${rev_overlap_n}\t${rev_overlap_frac}\t${jaccard}\t${intersection_bp}\t${union_bp}" \
+    >> "$SUMMARY"
+
+    echo "[OK] both : $both"
+    echo "[OK] union: $union"
+
+done < "$RUNLIST"
+
+echo
+echo "[ALL DONE]"
+echo "summary: $SUMMARY"
+
+chmod +x build_both_union_overlap.sh
+bash build_both_union_overlap.sh
+#查看overlap表（关注fwd_overlap_frac、rev_overlap_frac、jaccard这些列，因为考虑到前面得到的fwd结果和rev结果比较像，所以看是否是因为在两个方向上预测到了相同的位置）
+column -t -s $'\t' \
+/data/mshe/deepRloopPro_data/fwd_rev_overlap/fwd_rev_overlap_summary.tsv \
+| less -S
+#看both是否包含两个方向
+BED=/data/mshe/deepRloopPro_data/deepRloop_results_A_both/Bauhinia_variegata_GCA_022379115.2_final_predict.bed
+cut -f6 "$BED" | sort | uniq -c
+#第三个应该等于前面两个相加
+wc -l \
+/data/mshe/deepRloopPro_data/deepRloop_results_A/Bauhinia_variegata_GCA_022379115.2_final_predict.bed \
+/data/mshe/deepRloopPro_data/deepRloop_results_A_rev/Bauhinia_variegata_GCA_022379115.2_rev_final_predict.bed \
+/data/mshe/deepRloopPro_data/deepRloop_results_A_both/Bauhinia_variegata_GCA_022379115.2_final_predict.bed
