@@ -154,23 +154,25 @@ get_gc() {
 
     /^>/ {
         name=substr($0,2)
-        split(name,a,/[\t ]/)
-        use=(a[1] in keep)
+        split(name,header,/[\t ]/)
+        use=(header[1] in keep)
         next
     }
 
     use {
         s=toupper($0)
-        g+=gsub(/G/,"G",s)
-        c+=gsub(/C/,"C",s)
-        a+=gsub(/A/,"A",s)
-        t+=gsub(/T/,"T",s)
+
+        nG += gsub(/G/,"G",s)
+        nC += gsub(/C/,"C",s)
+        nA += gsub(/A/,"A",s)
+        nT += gsub(/T/,"T",s)
     }
 
     END {
-        total=a+t+g+c
+        total=nA+nT+nG+nC
+
         if(total>0)
-            printf "%.6f\n",(g+c)/total
+            printf "%.6f\n",(nG+nC)/total
         else
             print "NA"
     }' "$chrom" "$fasta"
@@ -359,7 +361,7 @@ echo "$OUT"
 EOF
 
 chmod +x make_genedata_rloop_summary_both_union.sh
-bash make_genedata_rloop_summary_both_union.sh
+CALC_GC=1 bash make_genedata_rloop_summary_both_union.sh
 #查看表格
 column -t -s $'\t' \
 /data/mshe/deepRloopPro_data/genedata_rloop_summary_both_union.tsv \
