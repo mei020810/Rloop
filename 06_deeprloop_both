@@ -1,7 +1,651 @@
 #输出both的数据汇总表
-cp make_genedata_rloop_summary.sh \
-   make_genedata_rloop_summary_both.sh
-vim make_genedata_rloop_summary_both.sh
-###需要改的代码如下
-BED_DIR="deepRloop_results_A_both"
-OUT="genedata_rloop_summary_both.tsv"
+cat > make_genedata_rloop_summary_both_union.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+RUNLIST="/data/mshe/deepRloopPro_data/new_list_A.tsv"
+ANNOTATION_LIST="/data/mshe/deepRloopPro_data/annotation_list_new.tsv"
+BRANCH_MAP="/data/mshe/deepRloopPro_data/species_branch_map_20.clean.tsv"
+BOTH_DIR="/data/mshe/deepRloopPro_data/deepRloop_results_A_both"
+UNION_DIR="/data/mshe/deepRloopPro_data/deepRloop_results_A_union"
+OUT="/data/mshe/deepRloopPro_data/genedata_rloop_summary_both_union.tsv"
+
+# 1 = 计算GC；0 = 不计算
+CALC_GC="${CALC_GC:-0}"
+printf "species\tsubfamily\tmajor_branch\tassembly_size_bp\tmain_chr_n\tmain_chr_size_bp\tgene_number_main_chr\tgene_number_source\tgene_density_per_Mb\tGC_content_main_chr\tfwd_event_number\trev_event_number\tRloop_strand_event_number\tRloop_strand_event_mean_length\tRloop_strand_event_density_per_100Mb\tRloop_union_total_bp\tRloop_union_coverage_ratio\n" > "$OUT"
+
+declare -A FASTAMAP
+declare -A CHRMAP
+declare -A FAIMAP
+declare -A ANNOMAP
+declare -A SUBFAMILY
+declare -A BRANCH
+
+# ------------------------------------------------------------
+# 读取输入文件
+# ------------------------------------------------------------
+while IFS=$'\t' read -r sp fasta chrom fai rest
+do
+    [[ -z "${sp:-}" ]] && continue
+    [[ "$sp" == "species" || "$sp" == "prefix" ]] && continue
+
+    FASTAMAP["$sp"]="$fasta"
+    CHRMAP["$sp"]="$chrom"
+    FAIMAP["$sp"]="$fai"
+done < "$RUNLIST"
+
+while IFS=$'\t' read -r sp anno chrom rest
+do
+    [[ -z "${sp:-}" ]] && continue
+    [[ "$sp" == "species" || "$sp" == "prefix" ]] && continue
+
+    ANNOMAP["$sp"]="$anno"
+done < "$ANNOTATION_LIST"
+
+while IFS=$'\t' read -r sp sf br rest
+do
+    [[ -z "${sp:-}" ]] && continue
+    [[ "$sp" == "species" ]] && continue
+
+    SUBFAMILY["$sp"]="$sf"
+    BRANCH["$sp"]="$br"
+done < "$BRANCH_MAP"
+
+# ------------------------------------------------------------
+# gene number
+# gene feature优先；没有时使用mRNA/transcript作为proxy
+# ------------------------------------------------------------
+get_gene_number_and_source() {
+    local anno="$1"
+    local chrom="$2"
+
+    if [[ ! -f "$anno" || ! -f "$chrom" ]]; then
+        echo -e "NA\tNA"
+        return
+    fi
+
+    awk '
+    BEGIN{FS=OFS="\t"}
+
+    NR==FNR {
+        keep[$1]=1
+        next
+    }
+
+    /^#/ {next}
+    !($1 in keep) {next}
+
+    function get_id(attr, fallback, id, a) {
+        id=""
+
+        if (match(attr,/gene_id "[^"]+"/)) {
+            id=substr(attr,RSTART+9,RLENGTH-10)
+        }
+        else if (match(attr,/Parent=[^;]+/)) {
+            id=substr(attr,RSTART+7,RLENGTH-7)
+        }
+        else if (match(attr,/ID=[^;]+/)) {
+            id=substr(attr,RSTART+3,RLENGTH-3)
+        }
+        else {
+            id=fallback
+        }
+
+        split(id,a,",")
+        id=a[1]
+
+        gsub(/^gene:/,"",id)
+        sub(/-t[0-9]+.*$/,"",id)
+        sub(/\.t[0-9]+$/,"",id)
+        sub(/_mRNA[0-9]+$/,"",id)
+
+        return id
+    }
+
+    $3=="gene" {
+        gene_n++
+        next
+    }
+
+    $3=="mRNA" {
+        id=get_id($9,$1":"$4"-"$5":"$7)
+        mrna[id]=1
+    }
+
+    $3=="transcript" {
+        id=get_id($9,$1":"$4"-"$5":"$7)
+        transcript[id]=1
+    }
+
+    END {
+        if (gene_n>0) {
+            print gene_n,"gene"
+        }
+        else {
+            for (x in mrna) m++
+            for (x in transcript) t++
+
+            if (m>0)
+                print m,"mRNA_proxy"
+            else if (t>0)
+                print t,"transcript_proxy"
+            else
+                print 0,"unavailable"
+        }
+    }' "$chrom" "$anno"
+}
+
+# ------------------------------------------------------------
+# GC
+# ------------------------------------------------------------
+get_gc() {
+    local fasta="$1"
+    local chrom="$2"
+
+    if [[ "$CALC_GC" != "1" ]]; then
+        echo "NA"
+        return
+    fi
+
+    awk '
+    NR==FNR {
+        keep[$1]=1
+        next
+    }
+
+    /^>/ {
+        name=substr($0,2)
+        split(name,a,/[\t ]/)
+        use=(a[1] in keep)
+        next
+    }
+
+    use {
+        s=toupper($0)
+        g+=gsub(/G/,"G",s)
+        c+=gsub(/C/,"C",s)
+        a+=gsub(/A/,"A",s)
+        t+=gsub(/T/,"T",s)
+    }
+
+    END {
+        total=a+t+g+c
+        if(total>0)
+            printf "%.6f\n",(g+c)/total
+        else
+            print "NA"
+    }' "$chrom" "$fasta"
+}
+
+# ------------------------------------------------------------
+# both：
+# fwd/rev数量 + 总strand event数量 + event平均长度
+# ------------------------------------------------------------
+get_both_stats() {
+    local both="$1"
+    local chrom="$2"
+
+    awk '
+    BEGIN{FS=OFS="\t"}
+
+    NR==FNR {
+        keep[$1]=1
+        next
+    }
+
+    /^#/ {next}
+
+    ($1 in keep) && $3>$2 {
+        len=$3-$2
+
+        n++
+        sum+=len
+
+        if($6=="+")
+            fwd++
+        else if($6=="-")
+            rev++
+        else
+            other++
+    }
+
+    END {
+        mean=(n>0 ? sum/n : 0)
+
+        printf "%d\t%d\t%d\t%.2f\t%d\n",
+               fwd+0,rev+0,n+0,mean,other+0
+    }' "$chrom" "$both"
+}
+
+# ------------------------------------------------------------
+# union：
+# 只计算非冗余覆盖bp
+# ------------------------------------------------------------
+get_union_bp() {
+    local union="$1"
+    local chrom="$2"
+
+    awk '
+    NR==FNR {
+        keep[$1]=1
+        next
+    }
+
+    ($1 in keep) && $3>$2 {
+        sum += $3-$2
+    }
+
+    END {
+        print sum+0
+    }' "$chrom" "$union"
+}
+
+# ------------------------------------------------------------
+# 主循环
+# ------------------------------------------------------------
+while IFS=$'\t' read -r sp fasta chrom fai rest
+do
+    [[ -z "${sp:-}" ]] && continue
+    [[ "$sp" == "species" || "$sp" == "prefix" ]] && continue
+
+    echo "[INFO] $sp"
+
+    both="$BOTH_DIR/${sp}_final_predict.bed"
+    union="$UNION_DIR/${sp}_total_rloop_union.bed"
+
+    anno="${ANNOMAP[$sp]:-NA}"
+    sf="${SUBFAMILY[$sp]:-NA}"
+    br="${BRANCH[$sp]:-NA}"
+
+    if [[ ! -s "$both" ]]; then
+        echo "[WARN] missing both: $both" >&2
+        continue
+    fi
+
+    if [[ ! -s "$union" ]]; then
+        echo "[WARN] missing union: $union" >&2
+        continue
+    fi
+
+    if [[ ! -s "$chrom" ]]; then
+        echo "[WARN] missing chromsize: $chrom" >&2
+        continue
+    fi
+
+    # genome信息
+    assembly_size=$(
+        awk '{s+=$2} END{print s+0}' "$fai"
+    )
+
+    main_chr_n=$(wc -l < "$chrom")
+
+    main_chr_size=$(
+        awk '{s+=$2} END{print s+0}' "$chrom"
+    )
+
+    # gene信息
+    if [[ "$anno" != "NA" && -f "$anno" ]]; then
+        read -r gene_n gene_source < <(
+            get_gene_number_and_source "$anno" "$chrom"
+        )
+    else
+        gene_n="NA"
+        gene_source="NA"
+    fi
+
+    if [[ "$gene_n" != "NA" && "$main_chr_size" -gt 0 ]]; then
+        gene_density=$(
+            awk -v g="$gene_n" -v s="$main_chr_size" \
+            'BEGIN{printf "%.4f",g/(s/1000000)}'
+        )
+    else
+        gene_density="NA"
+    fi
+
+    gc=$(get_gc "$fasta" "$chrom")
+
+    # both统计
+    read -r fwd_n rev_n event_n event_mean other_n < <(
+        get_both_stats "$both" "$chrom"
+    )
+
+    if [[ "$other_n" -ne 0 ]]; then
+        echo "[WARN] $sp has $other_n records whose strand is not +/-" >&2
+    fi
+
+    event_density=$(
+        awk -v n="$event_n" -v s="$main_chr_size" \
+        'BEGIN{
+            if(s>0) printf "%.2f",n/s*100000000;
+            else print "NA"
+        }'
+    )
+
+    # union统计
+    union_bp=$(get_union_bp "$union" "$chrom")
+
+    union_coverage=$(
+        awk -v b="$union_bp" -v s="$main_chr_size" \
+        'BEGIN{
+            if(s>0) printf "%.6f",b/s;
+            else print "NA"
+        }'
+    )
+
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$sp" \
+        "$sf" \
+        "$br" \
+        "$assembly_size" \
+        "$main_chr_n" \
+        "$main_chr_size" \
+        "$gene_n" \
+        "$gene_source" \
+        "$gene_density" \
+        "$gc" \
+        "$fwd_n" \
+        "$rev_n" \
+        "$event_n" \
+        "$event_mean" \
+        "$event_density" \
+        "$union_bp" \
+        "$union_coverage" \
+        >> "$OUT"
+
+done < "$RUNLIST"
+
+echo
+echo "[OK] generated:"
+echo "$OUT"
+EOF
+
+chmod +x make_genedata_rloop_summary_both_union.sh
+bash make_genedata_rloop_summary_both_union.sh
+#查看表格
+column -t -s $'\t' \
+/data/mshe/deepRloopPro_data/genedata_rloop_summary_both_union.tsv \
+| less -S
+#再看看fwd和rev在空间上的重叠
+vim make_fwd_rev_overlap_summary.sh
+
+#!/usr/bin/env bash
+set -euo pipefail
+RUNLIST=/data/mshe/deepRloopPro_data/new_list_A.tsv
+FWDDIR=/data/mshe/deepRloopPro_data/deepRloop_results_A
+REVDIR=/data/mshe/deepRloopPro_data/deepRloop_results_A_rev
+OUTDIR=/data/mshe/deepRloopPro_data/fwd_rev_overlap
+OUT="$OUTDIR/fwd_rev_overlap_summary.tsv"
+mkdir -p "$OUTDIR"
+# ------------------------------------------------------------
+# 输出列说明
+#
+# fwd_n:
+#   fwd预测peak总数
+# rev_n:
+#   rev预测peak总数
+# fwd_overlap_n:
+#   至少与一个rev peak发生重叠的fwd peak数量
+# rev_overlap_n:
+#   至少与一个fwd peak发生重叠的rev peak数量
+# fwd_unique_n / rev_unique_n:
+#   完全不与对方strand发生重叠的peak数量
+# fwd_overlap_frac / rev_overlap_frac:
+#   上述overlap peak占本strand所有peak的比例
+# intersection_bp:
+#   fwd和rev在基因组上共同覆盖的非冗余bp
+# union_bp:
+#   fwd或rev任意一个方向覆盖的非冗余bp
+# jaccard:
+#   intersection_bp / union_bp
+#   0 = 完全不重叠
+#   1 = 完全相同
+# ------------------------------------------------------------
+
+printf "species\tfwd_n\trev_n\tfwd_overlap_n\tfwd_unique_n\tfwd_overlap_frac\trev_overlap_n\trev_unique_n\trev_overlap_frac\tfwd_merged_bp\trev_merged_bp\tintersection_bp\tunion_bp\tjaccard\n" \
+> "$OUT"
+
+while IFS=$'\t' read -r sp fasta chrom fai rest
+do
+    [[ -z "${sp:-}" ]] && continue
+    [[ "$sp" == "species" || "$sp" == "prefix" ]] && continue
+
+    echo "=================================================="
+    echo "[INFO] $sp"
+
+    fwd="$FWDDIR/${sp}_final_predict.bed"
+    rev="$REVDIR/${sp}_rev_final_predict.bed"
+
+    if [[ ! -s "$fwd" ]]; then
+        echo "[WARN] missing fwd: $fwd" >&2
+        continue
+    fi
+
+    if [[ ! -s "$rev" ]]; then
+        echo "[WARN] missing rev: $rev" >&2
+        continue
+    fi
+
+    if [[ ! -s "$chrom" ]]; then
+        echo "[WARN] missing chromsize: $chrom" >&2
+        continue
+    fi
+
+    TMPDIR=$(mktemp -d "$OUTDIR/${sp}.XXXXXX")
+    trap 'rm -rf "$TMPDIR"' EXIT
+
+    fwd_sorted="$TMPDIR/fwd.sorted.bed"
+    rev_sorted="$TMPDIR/rev.sorted.bed"
+
+    fwd_merged="$TMPDIR/fwd.merged.bed"
+    rev_merged="$TMPDIR/rev.merged.bed"
+
+    # --------------------------------------------------------
+    # 1. 只保留chromsize中列出的染色体/主序列，并排序
+    # --------------------------------------------------------
+    awk 'BEGIN{FS=OFS="\t"}
+    NR==FNR {
+        keep[$1]=1
+        next
+    }
+    $0 !~ /^#/ && NF>=3 && ($1 in keep) && $3>$2 {
+        print
+    }' "$chrom" "$fwd" \
+      | bedtools sort -g "$chrom" -i - \
+      > "$fwd_sorted"
+
+    awk 'BEGIN{FS=OFS="\t"}
+    NR==FNR {
+        keep[$1]=1
+        next
+    }
+    $0 !~ /^#/ && NF>=3 && ($1 in keep) && $3>$2 {
+        print
+    }' "$chrom" "$rev" \
+      | bedtools sort -g "$chrom" -i - \
+      > "$rev_sorted"
+
+    # --------------------------------------------------------
+    # 2. strand QC
+    # --------------------------------------------------------
+    fwd_bad=$(
+        awk '$6!="+" {n++} END{print n+0}' "$fwd_sorted"
+    )
+
+    rev_bad=$(
+        awk '$6!="-" {n++} END{print n+0}' "$rev_sorted"
+    )
+
+    if [[ "$fwd_bad" -ne 0 ]]; then
+        echo "[WARN] $sp: $fwd_bad fwd records are not +" >&2
+    fi
+
+    if [[ "$rev_bad" -ne 0 ]]; then
+        echo "[WARN] $sp: $rev_bad rev records are not -" >&2
+    fi
+
+    # --------------------------------------------------------
+    # 3. peak总数
+    # --------------------------------------------------------
+    fwd_n=$(wc -l < "$fwd_sorted")
+    rev_n=$(wc -l < "$rev_sorted")
+
+    # --------------------------------------------------------
+    # 4. peak-level overlap
+    # -u:
+    #   一个peak只计一次，即使它与多个对方peak重叠
+    # -v:
+    #   完全不与对方peak重叠
+    # --------------------------------------------------------
+    fwd_overlap_n=$(
+        bedtools intersect \
+          -u \
+          -a "$fwd_sorted" \
+          -b "$rev_sorted" \
+        | wc -l
+    )
+
+    rev_overlap_n=$(
+        bedtools intersect \
+          -u \
+          -a "$rev_sorted" \
+          -b "$fwd_sorted" \
+        | wc -l
+    )
+
+    fwd_unique_n=$(
+        bedtools intersect \
+          -v \
+          -a "$fwd_sorted" \
+          -b "$rev_sorted" \
+        | wc -l
+    )
+
+    rev_unique_n=$(
+        bedtools intersect \
+          -v \
+          -a "$rev_sorted" \
+          -b "$fwd_sorted" \
+        | wc -l
+    )
+
+    fwd_overlap_frac=$(
+        awk -v x="$fwd_overlap_n" -v n="$fwd_n" '
+        BEGIN{
+            if(n>0) printf "%.6f",x/n;
+            else print "NA"
+        }'
+    )
+
+    rev_overlap_frac=$(
+        awk -v x="$rev_overlap_n" -v n="$rev_n" '
+        BEGIN{
+            if(n>0) printf "%.6f",x/n;
+            else print "NA"
+        }'
+    )
+
+    # --------------------------------------------------------
+    # 5. 各strand内部先merge
+    # 这样后面的bp-level overlap不会因为同一strand内部peak
+    # 自身重叠而重复计数
+    # --------------------------------------------------------
+    cut -f1-3 "$fwd_sorted" \
+      | bedtools merge -i - \
+      > "$fwd_merged"
+
+    cut -f1-3 "$rev_sorted" \
+      | bedtools merge -i - \
+      > "$rev_merged"
+
+    # 各方向非冗余覆盖bp
+    fwd_merged_bp=$(
+        awk '{s += $3-$2} END{print s+0}' "$fwd_merged"
+    )
+
+    rev_merged_bp=$(
+        awk '{s += $3-$2} END{print s+0}' "$rev_merged"
+    )
+
+    # --------------------------------------------------------
+    # 6. fwd/rev共同覆盖bp
+    # 两边都已经各自merge，因此这里的overlap长度不会重复累计
+    # --------------------------------------------------------
+    intersection_bp=$(
+        bedtools intersect \
+          -a "$fwd_merged" \
+          -b "$rev_merged" \
+          -wo \
+        | awk '{s += $NF} END{print s+0}'
+    )
+
+    # --------------------------------------------------------
+    # 7. union bp
+    #
+    # |A union B| = |A| + |B| - |A intersection B|
+    # --------------------------------------------------------
+    union_bp=$(
+        awk \
+          -v a="$fwd_merged_bp" \
+          -v b="$rev_merged_bp" \
+          -v i="$intersection_bp" \
+          'BEGIN{print a+b-i}'
+    )
+
+    # Jaccard
+    jaccard=$(
+        awk \
+          -v i="$intersection_bp" \
+          -v u="$union_bp" '
+        BEGIN{
+            if(u>0) printf "%.6f",i/u;
+            else print "NA"
+        }'
+    )
+
+    # --------------------------------------------------------
+    # 8. 基本一致性检查
+    # --------------------------------------------------------
+    if [[ $((fwd_overlap_n + fwd_unique_n)) -ne "$fwd_n" ]]; then
+        echo "[WARN] $sp: fwd overlap + unique != total" >&2
+    fi
+
+    if [[ $((rev_overlap_n + rev_unique_n)) -ne "$rev_n" ]]; then
+        echo "[WARN] $sp: rev overlap + unique != total" >&2
+    fi
+
+    # --------------------------------------------------------
+    # 9. 输出
+    # --------------------------------------------------------
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$sp" \
+        "$fwd_n" \
+        "$rev_n" \
+        "$fwd_overlap_n" \
+        "$fwd_unique_n" \
+        "$fwd_overlap_frac" \
+        "$rev_overlap_n" \
+        "$rev_unique_n" \
+        "$rev_overlap_frac" \
+        "$fwd_merged_bp" \
+        "$rev_merged_bp" \
+        "$intersection_bp" \
+        "$union_bp" \
+        "$jaccard" \
+        >> "$OUT"
+
+    echo "[OK] fwd overlap fraction = $fwd_overlap_frac"
+    echo "[OK] rev overlap fraction = $rev_overlap_frac"
+    echo "[OK] Jaccard              = $jaccard"
+
+    rm -rf "$TMPDIR"
+    trap - EXIT
+
+done < "$RUNLIST"
+
+echo
+echo "[ALL DONE]"
+echo "$OUT"
+
+chmod +x make_fwd_rev_overlap_summary.sh
+bash make_fwd_rev_overlap_summary.sh
+column -t -s $'\t' /data/mshe/deepRloopPro_data/fwd_rev_overlap/fwd_rev_overlap_summary.tsv | less -S
+
