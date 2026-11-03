@@ -857,3 +857,166 @@ for protein in "$PROTEIN_DIR"/*.protein.fa; do
         echo "[FAILED] $sample"
     fi
 done
+ls 04_busco_protein/*.done | wc -l
+#结果为79，因为hoita物种的在试验已生成，因此创建一个空文件表明Hoita的busco已完成
+touch 04_busco_protein/Hoita_strobilina_GCA_054297685.1.done
+ls 04_busco_protein/*.done | wc -l
+
+#汇总QC表
+PRODIR="03_proteomes/protein"
+BUSCODIR="04_busco_protein"
+OUT="05_annotation_qc.tsv"
+
+echo -e "Species\tProtein_n\tMean_length\tMedian_length\tMax_length\tLT50_n\tLT50_pct\tLT100_n\tLT100_pct\tBUSCO_C\tBUSCO_S\tBUSCO_D\tBUSCO_F\tBUSCO_M\tBUSCO_n" > "$OUT"
+
+for protein in "$PRODIR"/*.protein.fa; do
+
+    sample=$(basename "$protein" .protein.fa)
+    tmp=$(mktemp)
+
+    seqkit fx2tab -n -l "$protein" | cut -f2 > "$tmp"
+
+    n=$(wc -l < "$tmp")
+    mean=$(awk '{s+=$1} END{printf "%.1f",s/NR}' "$tmp")
+    median=$(sort -n "$tmp" | awk '{a[NR]=$1} END{
+        if(NR%2) print a[(NR+1)/2];
+        else printf "%.1f",(a[NR/2]+a[NR/2+1])/2
+    }')
+    max=$(sort -nr "$tmp" | head -1)
+
+    lt50=$(awk '$1<50{n++} END{print n+0}' "$tmp")
+    lt100=$(awk '$1<100{n++} END{print n+0}' "$tmp")
+
+    lt50pct=$(awk -v a="$lt50" -v n="$n" 'BEGIN{printf "%.1f",a/n*100}')
+    lt100pct=$(awk -v a="$lt100" -v n="$n" 'BEGIN{printf "%.1f",a/n*100}')
+
+    summary=$(ls "$BUSCODIR/$sample"/short_summary*.txt 2>/dev/null | head -1)
+
+    line=$(grep -m1 'C:' "$summary")
+
+    C=$(echo "$line" | sed -n 's/.*C:\([0-9.]*\)%.*/\1/p')
+    S=$(echo "$line" | sed -n 's/.*S:\([0-9.]*\)%.*/\1/p')
+    D=$(echo "$line" | sed -n 's/.*D:\([0-9.]*\)%.*/\1/p')
+    F=$(echo "$line" | sed -n 's/.*F:\([0-9.]*\)%.*/\1/p')
+    M=$(echo "$line" | sed -n 's/.*M:\([0-9.]*\)%.*/\1/p')
+    N=$(echo "$line" | sed -n 's/.*n:\([0-9]*\).*/\1/p')
+
+    echo -e "$sample\t$n\t$mean\t$median\t$max\t$lt50\t$lt50pct\t$lt100\t$lt100pct\t$C\t$S\t$D\t$F\t$M\t$N" >> "$OUT"
+
+    rm -f "$tmp"
+done
+column -t 05_annotation_qc.tsv | less -S
+wc -l 05_annotation_qc.tsv
+
+#Mimosa物种用gffread跑数据有异常（C=0.2%），故改用agat来拼接蛋白序列
+conda activate agat
+sample="Mimosa_bimucronata_GWHDODZ00000000"
+FA="00_genomes/genomes_fasta/${sample}.fna"
+GFF="02_helixer/gff3/${sample}.helixer.gff3"
+agat_sp_extract_sequences.pl \
+    -g "$GFF" \
+    -f "$FA" \
+    -t cds \
+    -p \
+    -o /tmp/Mimosa.agat.protein.fa
+
+seqkit stats /tmp/Mimosa.agat.protein.fa
+#统计agat蛋白的“內部stop”
+awk '
+function check_seq() {
+    if (seq=="") return
+
+    total++
+
+    x=seq
+    if (x ~ /\*$/) {
+        terminal++
+        sub(/\*$/, "", x)
+    }
+
+    n=gsub(/\*/, "", x)
+
+    if (n>0) {
+        internal_proteins++
+        internal_sites+=n
+    }
+}
+
+/^>/ {
+    check_seq()
+    seq=""
+    next
+}
+
+{
+    seq=seq $0
+}
+
+END {
+    check_seq()
+
+    print "total proteins:", total
+    print "with terminal stop:", terminal+0
+    print "with internal stop:", internal_proteins+0
+    print "internal stop sites:", internal_sites+0
+    printf "internal-stop protein pct: %.2f%%\n", internal_proteins/total*100
+}
+' /tmp/Mimosa.agat.protein.fa
+#busco检验
+conda activate busco6
+busco \
+  -i /tmp/Mimosa.agat.protein.fa \
+  -m proteins \
+  -l 01_busco_db/lineages/fabales_odb12.2 \
+  --offline \
+  -o Mimosa_AGAT_protein \
+  --out_path 04_busco_protein_check \
+  -c 16
+cat 04_busco_protein_check/Mimosa_AGAT_protein/short_summary*.txt  #此处 C=89.9%，与基因组的busco相近
+#备份旧文件
+sample="Mimosa_bimucronata_GWHDODZ00000000"
+mv \
+03_proteomes/protein/${sample}.protein.fa \
+03_proteomes/protein/${sample}.protein.gffread.bad.fa
+#重新跑agat到正确位置上
+conda activate agat
+agat_sp_extract_sequences.pl \
+  -g 02_helixer/gff3/${sample}.helixer.gff3 \
+  -f 00_genomes/genomes_fasta/${sample}.fna \
+  -t cds \
+  -p \
+  -o 03_proteomes/protein/${sample}.protein.fa
+#检查
+seqkit stats 03_proteomes/protein/${sample}.protein.fa
+#删除错误的busco重跑
+rm -rf \
+04_busco_protein/${sample} \
+04_busco_protein/${sample}.done
+conda activate busco6
+
+busco \
+  -i 03_proteomes/protein/${sample}.protein.fa \
+  -m proteins \
+  -l 01_busco_db/lineages/fabales_odb12.2 \
+  --offline \
+  -o "$sample" \
+  --out_path 04_busco_protein \
+  -c 16
+touch 04_busco_protein/${sample}.done
+#agat是用*作为蛋白末尾终止符，需要去掉
+sample="Mimosa_bimucronata_GWHDODZ00000000"
+seqkit replace \
+  -p '\*$' \
+  -r '' \
+  -s \
+  03_proteomes/protein/${sample}.protein.fa \
+  > 03_proteomes/protein/${sample}.protein.tmp.fa
+mv \
+03_proteomes/protein/${sample}.protein.tmp.fa \
+03_proteomes/protein/${sample}.protein.fa
+#检查
+grep -v '^>' \
+03_proteomes/protein/${sample}.protein.fa \
+| grep '\*' | head
+ls 03_proteomes/protein/*.protein.fa | wc -l
+find 03_proteomes/protein -name "*.protein.fa" -size 0
