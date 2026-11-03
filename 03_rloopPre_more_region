@@ -1039,12 +1039,12 @@ bash make_genedata_rloop_summary.sh  #需要计算GC content 时可用 CALC_GC=1
 #用新表格生成图（因为新表格的覆盖比例是去重后的，有些rloop区间有重叠，此版本为去重叠版本）
 cat > plot_rloop_summary_merged_coverage.R <<'EOF'
 #!/usr/bin/env Rscript
+
 # 用法:
 # Rscript plot_rloop_summary_merged_coverage.R genedata_rloop_summary.tsv summary_plots_merged
 #
 # 第1个参数: 输入TSV
 # 第2个参数: 输出目录
-#
 
 args <- commandArgs(trailingOnly = TRUE)
 input_file <- if (length(args) >= 1) args[1] else "genedata_rloop_summary.tsv"
@@ -1078,14 +1078,23 @@ required_cols <- c(
   "species",
   "subfamily",
   "major_branch",
-  "main_chr_n",
-  "main_chr_size_bp",
+  "assembly_size_bp",
+  "assembly_main_chr_n",
+  "biological_main_chr_n",
+  "biological_main_chr_size_bp",
+  "gene_number_biological_main_chr",
+  "gene_number_source",
+  "gene_density_per_Mb",
+  "GC_content_main_chr",
   "Rloop_region_number",
+  "Rloop_total_bp",
   "Rloop_merged_total_bp",
   "Rloop_mean_length",
   "Rloop_density_per_100Mb",
+  "Rloop_coverage_ratio",
   "Rloop_merged_coverage_ratio",
-  "Rloop_per_chr_mean"
+  "Rloop_per_biological_chr_mean",
+  "Rloop_per_biological_chr_counts"
 )
 
 missing_cols <- setdiff(required_cols, colnames(df0))
@@ -1094,18 +1103,25 @@ if (length(missing_cols) > 0) {
 }
 
 num_cols <- c(
-  "main_chr_n",
-  "main_chr_size_bp",
+  "assembly_size_bp",
+  "assembly_main_chr_n",
+  "biological_main_chr_n",
+  "biological_main_chr_size_bp",
+  "gene_number_biological_main_chr",
+  "gene_density_per_Mb",
+  "GC_content_main_chr",
   "Rloop_region_number",
+  "Rloop_total_bp",
   "Rloop_merged_total_bp",
   "Rloop_mean_length",
   "Rloop_density_per_100Mb",
+  "Rloop_coverage_ratio",
   "Rloop_merged_coverage_ratio",
-  "Rloop_per_chr_mean"
+  "Rloop_per_biological_chr_mean"
 )
 
 df0 <- df0 %>%
-  mutate(across(all_of(num_cols), as.numeric))
+  mutate(across(all_of(num_cols), ~ suppressWarnings(as.numeric(.x))))
 
 # 物种简写：去掉 accession，保留属种名
 make_species_label <- function(x) {
@@ -1134,28 +1150,39 @@ df <- df0 %>%
     物种 = species,
     亚科 = subfamily,
     主要分支 = major_branch,
-    染色体数 = main_chr_n,
-    主染色体总长度 = main_chr_size_bp,
+
+    组装总长度 = assembly_size_bp,
+    组装主染色体数 = assembly_main_chr_n,
+    生物学主染色体数 = biological_main_chr_n,
+    生物学主染色体总长度 = biological_main_chr_size_bp,
+
+    主染色体基因数 = gene_number_biological_main_chr,
+    基因数来源 = gene_number_source,
+    基因密度_per_Mb = gene_density_per_Mb,
+    GC含量 = GC_content_main_chr,
+
     Rloop区域数 = Rloop_region_number,
-
-    # 总覆盖长度：merge 后非冗余覆盖长度
-    总覆盖长度 = Rloop_merged_total_bp,
-
+    Rloop原始总长度 = Rloop_total_bp,
+    Rloop合并总长度 = Rloop_merged_total_bp,
     平均区域长度 = Rloop_mean_length,
-
     每100Mb区域数 = Rloop_density_per_100Mb,
 
-    # 覆盖比例：merge 后非冗余覆盖比例
+    # 原始覆盖比例：未 merge 的总长度 / 主染色体总长度
+    Rloop原始覆盖比例 = Rloop_coverage_ratio,
+
+    # 推荐用于展示的覆盖比例：merge 后非冗余覆盖比例
     Rloop覆盖比例 = Rloop_merged_coverage_ratio,
 
-    平均每条染色体区域数 = Rloop_per_chr_mean
+    平均每条生物学染色体区域数 = Rloop_per_biological_chr_mean,
+    每条生物学染色体区域数 = Rloop_per_biological_chr_counts
   ) %>%
   mutate(
     物种简称 = make_species_label(物种),
     分支分组 = paste(亚科, 主要分支, sep = " | "),
     分支分组 = factor(分支分组, levels = branch_order),
     Rloop覆盖百分比 = Rloop覆盖比例 * 100,
-    主染色体总长度_Gb = 主染色体总长度 / 1e9
+    组装总长度_Gb = 组装总长度 / 1e9,
+    生物学主染色体总长度_Gb = 生物学主染色体总长度 / 1e9
   )
 
 write_tsv(df, file.path(outdir, "rloop_summary_cleaned.tsv"))
@@ -1252,9 +1279,28 @@ save_plot(p3, "03_species_mean_length_bar.png", width = 10, height = 9)
 save_plot(p3, "03_species_mean_length_bar.pdf", width = 10, height = 9)
 
 # ----------------------------
-# 4. 分支分组：覆盖比例箱线图
+# 4. 物种级：平均每条生物学染色体R-loop区域数
 # ----------------------------
-p4 <- ggplot(df, aes(x = 分支分组, y = Rloop覆盖比例, fill = 分支分组)) +
+df_biochr <- df %>%
+  arrange(平均每条生物学染色体区域数) %>%
+  mutate(物种简称 = factor(物种简称, levels = 物种简称))
+
+p4 <- ggplot(df_biochr, aes(x = 物种简称, y = 平均每条生物学染色体区域数, fill = 分支分组)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "各物种平均每条生物学染色体的R-loop区域数",
+    x = "物种",
+    y = "平均每条生物学染色体区域数"
+  )
+
+save_plot(p4, "04_species_rloop_per_biochr_bar.png", width = 10, height = 9)
+save_plot(p4, "04_species_rloop_per_biochr_bar.pdf", width = 10, height = 9)
+
+# ----------------------------
+# 5. 分支分组：覆盖比例箱线图
+# ----------------------------
+p5 <- ggplot(df, aes(x = 分支分组, y = Rloop覆盖比例, fill = 分支分组)) +
   geom_boxplot(outlier.shape = 21, outlier.size = 2) +
   geom_jitter(width = 0.15, alpha = 0.7, size = 2) +
   scale_x_discrete(labels = function(x) str_wrap(x, width = 18)) +
@@ -1269,13 +1315,13 @@ p4 <- ggplot(df, aes(x = 分支分组, y = Rloop覆盖比例, fill = 分支分�
     plot.margin = margin(t = 10, r = 10, b = 35, l = 35)
   )
 
-save_plot(p4, "04_branch_cov_ratio_boxplot.png", width = 10, height = 6)
-save_plot(p4, "04_branch_cov_ratio_boxplot.pdf", width = 10, height = 6)
+save_plot(p5, "05_branch_cov_ratio_boxplot.png", width = 10, height = 6)
+save_plot(p5, "05_branch_cov_ratio_boxplot.pdf", width = 10, height = 6)
 
 # ----------------------------
-# 5. 分支分组：每100Mb区域数箱线图
+# 6. 分支分组：每100Mb区域数箱线图
 # ----------------------------
-p5 <- ggplot(df, aes(x = 分支分组, y = 每100Mb区域数, fill = 分支分组)) +
+p6 <- ggplot(df, aes(x = 分支分组, y = 每100Mb区域数, fill = 分支分组)) +
   geom_boxplot(outlier.shape = 21, outlier.size = 2) +
   geom_jitter(width = 0.15, alpha = 0.7, size = 2) +
   scale_x_discrete(labels = function(x) str_wrap(x, width = 18)) +
@@ -1290,13 +1336,13 @@ p5 <- ggplot(df, aes(x = 分支分组, y = 每100Mb区域数, fill = 分支分�
     plot.margin = margin(t = 10, r = 10, b = 35, l = 35)
   )
 
-save_plot(p5, "05_branch_density_boxplot.png", width = 10, height = 6)
-save_plot(p5, "05_branch_density_boxplot.pdf", width = 10, height = 6)
+save_plot(p6, "06_branch_density_boxplot.png", width = 10, height = 6)
+save_plot(p6, "06_branch_density_boxplot.pdf", width = 10, height = 6)
 
 # ----------------------------
-# 6. 分支分组：平均区域长度箱线图
+# 7. 分支分组：平均区域长度箱线图
 # ----------------------------
-p6 <- ggplot(df, aes(x = 分支分组, y = 平均区域长度, fill = 分支分组)) +
+p7 <- ggplot(df, aes(x = 分支分组, y = 平均区域长度, fill = 分支分组)) +
   geom_boxplot(outlier.shape = 21, outlier.size = 2) +
   geom_jitter(width = 0.15, alpha = 0.7, size = 2) +
   scale_x_discrete(labels = function(x) str_wrap(x, width = 18)) +
@@ -1311,16 +1357,16 @@ p6 <- ggplot(df, aes(x = 分支分组, y = 平均区域长度, fill = 分支分�
     plot.margin = margin(t = 10, r = 10, b = 35, l = 35)
   )
 
-save_plot(p6, "06_branch_mean_length_boxplot.png", width = 10, height = 6)
-save_plot(p6, "06_branch_mean_length_boxplot.pdf", width = 10, height = 6)
+save_plot(p7, "07_branch_mean_length_boxplot.png", width = 10, height = 6)
+save_plot(p7, "07_branch_mean_length_boxplot.pdf", width = 10, height = 6)
 
 # ----------------------------
-# 7. 亚科：覆盖比例箱线图
+# 8. 亚科：覆盖比例箱线图
 # ----------------------------
 df_sub_cov <- df %>%
   mutate(亚科 = fct_reorder(亚科, Rloop覆盖比例, .fun = median, .desc = FALSE))
 
-p7 <- ggplot(df_sub_cov, aes(x = 亚科, y = Rloop覆盖比例, fill = 亚科)) +
+p8 <- ggplot(df_sub_cov, aes(x = 亚科, y = Rloop覆盖比例, fill = 亚科)) +
   geom_boxplot(outlier.shape = 21, outlier.size = 2) +
   geom_jitter(width = 0.15, alpha = 0.7, size = 2) +
   scale_x_discrete(labels = function(x) str_wrap(x, width = 18)) +
@@ -1335,13 +1381,13 @@ p7 <- ggplot(df_sub_cov, aes(x = 亚科, y = Rloop覆盖比例, fill = 亚科)) 
     plot.margin = margin(t = 10, r = 10, b = 35, l = 35)
   )
 
-save_plot(p7, "07_subfamily_cov_ratio_boxplot.png", width = 9, height = 6)
-save_plot(p7, "07_subfamily_cov_ratio_boxplot.pdf", width = 9, height = 6)
+save_plot(p8, "08_subfamily_cov_ratio_boxplot.png", width = 9, height = 6)
+save_plot(p8, "08_subfamily_cov_ratio_boxplot.pdf", width = 9, height = 6)
 
 # ----------------------------
-# 8. 散点图：密度 vs 覆盖比例
+# 9. 散点图：密度 vs 覆盖比例
 # ----------------------------
-p8 <- ggplot(df, aes(x = 每100Mb区域数, y = Rloop覆盖比例, color = 分支分组)) +
+p9 <- ggplot(df, aes(x = 每100Mb区域数, y = Rloop覆盖比例, color = 分支分组)) +
   geom_point(size = 3, alpha = 0.9) +
   labs(
     title = "R-loop密度与覆盖比例的关系",
@@ -1350,13 +1396,13 @@ p8 <- ggplot(df, aes(x = 每100Mb区域数, y = Rloop覆盖比例, color = 分�
     color = "亚科 | 主要分支"
   )
 
-save_plot(p8, "08_density_vs_covratio_scatter.png", width = 8, height = 6)
-save_plot(p8, "08_density_vs_covratio_scatter.pdf", width = 8, height = 6)
+save_plot(p9, "09_density_vs_covratio_scatter.png", width = 8, height = 6)
+save_plot(p9, "09_density_vs_covratio_scatter.pdf", width = 8, height = 6)
 
 # ----------------------------
-# 9. 散点图：平均区域长度 vs 覆盖比例
+# 10. 散点图：平均区域长度 vs 覆盖比例
 # ----------------------------
-p9 <- ggplot(df, aes(x = 平均区域长度, y = Rloop覆盖比例, color = 分支分组)) +
+p10 <- ggplot(df, aes(x = 平均区域长度, y = Rloop覆盖比例, color = 分支分组)) +
   geom_point(size = 3, alpha = 0.9) +
   labs(
     title = "平均区域长度与覆盖比例的关系",
@@ -1365,11 +1411,67 @@ p9 <- ggplot(df, aes(x = 平均区域长度, y = Rloop覆盖比例, color = 分�
     color = "亚科 | 主要分支"
   )
 
-save_plot(p9, "09_meanlength_vs_covratio_scatter.png", width = 8, height = 6)
-save_plot(p9, "09_meanlength_vs_covratio_scatter.pdf", width = 8, height = 6)
+save_plot(p10, "10_meanlength_vs_covratio_scatter.png", width = 8, height = 6)
+save_plot(p10, "10_meanlength_vs_covratio_scatter.pdf", width = 8, height = 6)
 
 # ----------------------------
-# 10. 分组统计表
+# 11. 散点图：主染色体总长度 vs 覆盖比例（log10横坐标）
+# ----------------------------
+p11 <- ggplot(df, aes(x = 生物学主染色体总长度_Gb, y = Rloop覆盖比例, color = 分支分组)) +
+  geom_point(size = 3, alpha = 0.9) +
+  scale_x_log10() +
+  labs(
+    title = "主染色体总长度与R-loop覆盖比例的关系",
+    subtitle = "x轴为 log10 scale",
+    x = "生物学主染色体总长度 (Gb, log10 scale)",
+    y = "R-loop覆盖比例",
+    color = "亚科 | 主要分支"
+  )
+
+save_plot(p11, "11_chrsize_vs_covratio_scatter_log10.png", width = 8, height = 6)
+save_plot(p11, "11_chrsize_vs_covratio_scatter_log10.pdf", width = 8, height = 6)
+
+# ----------------------------
+# 12. 散点图：基因密度 vs 覆盖比例
+# ----------------------------
+df_gene_density <- df %>%
+  filter(!is.na(基因密度_per_Mb))
+
+p12 <- ggplot(df_gene_density, aes(x = 基因密度_per_Mb, y = Rloop覆盖比例, color = 分支分组)) +
+  geom_point(size = 3, alpha = 0.9) +
+  labs(
+    title = "基因密度与R-loop覆盖比例的关系",
+    x = "基因密度 (genes/Mb)",
+    y = "R-loop覆盖比例",
+    color = "亚科 | 主要分支"
+  )
+
+save_plot(p12, "12_gene_density_vs_covratio_scatter.png", width = 8, height = 6)
+save_plot(p12, "12_gene_density_vs_covratio_scatter.pdf", width = 8, height = 6)
+
+# ----------------------------
+# 13. 可选：GC content vs 覆盖比例
+# 如果 GC_content_main_chr 全是 NA，这张图自动跳过。
+# ----------------------------
+df_gc <- df %>%
+  filter(!is.na(GC含量))
+
+if (nrow(df_gc) > 0) {
+  p13 <- ggplot(df_gc, aes(x = GC含量, y = Rloop覆盖比例, color = 分支分组)) +
+    geom_point(size = 3, alpha = 0.9) +
+    labs(
+      title = "GC含量与R-loop覆盖比例的关系",
+      x = "GC content of main chromosomes",
+      y = "R-loop覆盖比例",
+      color = "亚科 | 主要分支"
+    )
+
+  save_plot(p13, "13_gc_vs_covratio_scatter.png", width = 8, height = 6)
+  save_plot(p13, "13_gc_vs_covratio_scatter.pdf", width = 8, height = 6)
+}
+
+# ----------------------------
+# 14. 分组统计表
 # ----------------------------
 branch_summary <- df %>%
   group_by(分支分组) %>%
@@ -1381,6 +1483,10 @@ branch_summary <- df %>%
     密度_平均值 = mean(每100Mb区域数, na.rm = TRUE),
     平均长度_中位数 = median(平均区域长度, na.rm = TRUE),
     平均长度_平均值 = mean(平均区域长度, na.rm = TRUE),
+    每生物学染色体区域数_中位数 = median(平均每条生物学染色体区域数, na.rm = TRUE),
+    每生物学染色体区域数_平均值 = mean(平均每条生物学染色体区域数, na.rm = TRUE),
+    基因密度_中位数 = median(基因密度_per_Mb, na.rm = TRUE),
+    基因密度_平均值 = mean(基因密度_per_Mb, na.rm = TRUE),
     .groups = "drop"
   ) %>%
   arrange(desc(覆盖比例_中位数))
@@ -1397,6 +1503,10 @@ subfamily_summary <- df %>%
     密度_平均值 = mean(每100Mb区域数, na.rm = TRUE),
     平均长度_中位数 = median(平均区域长度, na.rm = TRUE),
     平均长度_平均值 = mean(平均区域长度, na.rm = TRUE),
+    每生物学染色体区域数_中位数 = median(平均每条生物学染色体区域数, na.rm = TRUE),
+    每生物学染色体区域数_平均值 = mean(平均每条生物学染色体区域数, na.rm = TRUE),
+    基因密度_中位数 = median(基因密度_per_Mb, na.rm = TRUE),
+    基因密度_平均值 = mean(基因密度_per_Mb, na.rm = TRUE),
     .groups = "drop"
   ) %>%
   arrange(desc(覆盖比例_中位数))
