@@ -651,3 +651,1108 @@ chmod +x make_fwd_rev_overlap_summary.sh
 bash make_fwd_rev_overlap_summary.sh
 column -t -s $'\t' /data/mshe/deepRloopPro_data/fwd_rev_overlap/fwd_rev_overlap_summary.tsv | less -S
 
+#作图
+vim plot_rloop_both_union_final.R
+
+#!/usr/bin/env Rscript
+# ============================================================
+# R-loop comparative plots
+# 输入1:
+#   genedata_rloop_summary_both_union.tsv
+# 输入2:
+#   fwd_rev_overlap_summary.tsv
+# 输入3:
+#   输出目录
+# 用法:
+# Rscript plot_rloop_both_union_final.R \
+#   genedata_rloop_summary_both_union.tsv \
+#   fwd_rev_overlap/fwd_rev_overlap_summary.tsv \
+#   rloop_plots_both_union
+# ============================================================
+args <- commandArgs(trailingOnly = TRUE)
+summary_file <- if (length(args) >= 1) {
+  args[1]
+} else {
+  "genedata_rloop_summary_both_union.tsv"
+}
+overlap_file <- if (length(args) >= 2) {
+  args[2]
+} else {
+  "fwd_rev_overlap/fwd_rev_overlap_summary.tsv"
+}
+outdir <- if (length(args) >= 3) {
+  args[3]
+} else {
+  "rloop_plots_both_union"
+}
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+# ============================================================
+# packages
+# ============================================================
+
+need_pkgs <- c(
+  "readr",
+  "dplyr",
+  "ggplot2",
+  "forcats",
+  "stringr"
+)
+
+for (pkg in need_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop(
+      sprintf(
+        "缺少R包: %s\n请安装: install.packages('%s')",
+        pkg, pkg
+      )
+    )
+  }
+}
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(stringr)
+
+has_ggrepel <- requireNamespace("ggrepel", quietly = TRUE)
+
+# ============================================================
+# read summary
+# ============================================================
+
+df <- read_tsv(
+  summary_file,
+  show_col_types = FALSE,
+  locale = locale(encoding = "UTF-8")
+)
+
+required_cols <- c(
+  "species",
+  "subfamily",
+  "major_branch",
+  "assembly_size_bp",
+  "main_chr_n",
+  "main_chr_size_bp",
+  "gene_number_main_chr",
+  "gene_density_per_Mb",
+  "GC_content_main_chr",
+  "fwd_event_number",
+  "rev_event_number",
+  "Rloop_strand_event_number",
+  "Rloop_strand_event_mean_length",
+  "Rloop_strand_event_density_per_100Mb",
+  "Rloop_union_total_bp",
+  "Rloop_union_coverage_ratio"
+)
+
+missing_cols <- setdiff(required_cols, colnames(df))
+
+if (length(missing_cols) > 0) {
+  stop(
+    "主表缺少必要列: ",
+    paste(missing_cols, collapse = ", ")
+  )
+}
+
+num_cols <- c(
+  "assembly_size_bp",
+  "main_chr_n",
+  "main_chr_size_bp",
+  "gene_number_main_chr",
+  "gene_density_per_Mb",
+  "GC_content_main_chr",
+  "fwd_event_number",
+  "rev_event_number",
+  "Rloop_strand_event_number",
+  "Rloop_strand_event_mean_length",
+  "Rloop_strand_event_density_per_100Mb",
+  "Rloop_union_total_bp",
+  "Rloop_union_coverage_ratio"
+)
+
+df <- df %>%
+  mutate(
+    across(
+      all_of(num_cols),
+      ~ suppressWarnings(as.numeric(.x))
+    )
+  )
+
+# ============================================================
+# species label
+# ============================================================
+
+make_species_label <- function(x) {
+
+  m <- stringr::str_match(
+    x,
+    "^([^_]+)_([^_]+)"
+  )
+
+  ifelse(
+    !is.na(m[, 1]),
+    paste(m[, 2], m[, 3]),
+    x
+  )
+}
+
+# ============================================================
+# lineage grouping
+#
+# basal_non_papilionoid不是一个真正等价的branch，
+# 因此这三个物种直接使用subfamily。
+# ============================================================
+
+lineage_order <- c(
+  "Cercidoideae",
+  "Dialioideae",
+  "Detarioideae",
+  "Mimoseae",
+  "Cassieae",
+  "genistoid",
+  "dalbergioid",
+  "IRLC",
+  "millettioid_phaseoloid"
+)
+
+df <- df %>%
+  mutate(
+
+    species_label = make_species_label(species),
+
+    lineage = case_when(
+      is.na(major_branch) ~ subfamily,
+      major_branch == "" ~ subfamily,
+      major_branch == "NA" ~ subfamily,
+      major_branch == "basal_non_papilionoid" ~ subfamily,
+      TRUE ~ major_branch
+    ),
+
+    lineage = factor(
+      lineage,
+      levels = lineage_order
+    ),
+
+    main_chr_size_Gb =
+      main_chr_size_bp / 1e9,
+
+    Rloop_union_coverage_percent =
+      Rloop_union_coverage_ratio * 100,
+
+    # GC如果存的是0~1则转成百分比；
+    # 如果本来就是百分比则保持不变
+    GC_content_percent = case_when(
+      is.na(GC_content_main_chr) ~ NA_real_,
+      GC_content_main_chr <= 1 ~
+        GC_content_main_chr * 100,
+      TRUE ~ GC_content_main_chr
+    )
+  )
+
+write_tsv(
+  df,
+  file.path(
+    outdir,
+    "genedata_rloop_summary_plot_cleaned.tsv"
+  )
+)
+
+# ============================================================
+# lineage sample numbers
+# ============================================================
+
+lineage_counts <- df %>%
+  count(lineage, name = "species_n")
+
+write_tsv(
+  lineage_counts,
+  file.path(
+    outdir,
+    "lineage_species_counts.tsv"
+  )
+)
+
+# ============================================================
+# theme
+# ============================================================
+
+theme_set(
+  theme_bw(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(face = "bold"),
+      legend.title = element_text(face = "bold")
+    )
+)
+
+# ============================================================
+# save png + pdf
+# ============================================================
+
+save_pair <- function(
+  p,
+  stem,
+  width = 8,
+  height = 6
+) {
+
+  ggsave(
+    filename = file.path(
+      outdir,
+      paste0(stem, ".png")
+    ),
+    plot = p,
+    width = width,
+    height = height,
+    dpi = 300
+  )
+
+  ggsave(
+    filename = file.path(
+      outdir,
+      paste0(stem, ".pdf")
+    ),
+    plot = p,
+    width = width,
+    height = height,
+    device = grDevices::cairo_pdf
+  )
+}
+
+# ============================================================
+# species labels for scatter plots
+# ============================================================
+
+add_species_labels <- function(
+  p,
+  data
+) {
+
+  if (has_ggrepel) {
+
+    p +
+      ggrepel::geom_text_repel(
+        data = data,
+        aes(label = species_label),
+        size = 2.8,
+        max.overlaps = Inf,
+        box.padding = 0.3,
+        point.padding = 0.2,
+        show.legend = FALSE
+      )
+
+  } else {
+
+    p +
+      geom_text(
+        data = data,
+        aes(label = species_label),
+        size = 2.7,
+        vjust = -0.7,
+        check_overlap = TRUE,
+        show.legend = FALSE
+      )
+  }
+}
+
+# ============================================================
+# Spearman
+# ============================================================
+
+spearman_test <- function(
+  data,
+  x,
+  y
+) {
+
+  tmp <- data %>%
+    filter(
+      !is.na(.data[[x]]),
+      !is.na(.data[[y]])
+    )
+
+  if (nrow(tmp) < 3) {
+
+    return(
+      tibble(
+        x = x,
+        y = y,
+        n = nrow(tmp),
+        spearman_rho = NA_real_,
+        p_value = NA_real_
+      )
+    )
+  }
+
+  ct <- suppressWarnings(
+    cor.test(
+      tmp[[x]],
+      tmp[[y]],
+      method = "spearman",
+      exact = FALSE
+    )
+  )
+
+  tibble(
+    x = x,
+    y = y,
+    n = nrow(tmp),
+    spearman_rho =
+      unname(ct$estimate),
+    p_value =
+      ct$p.value
+  )
+}
+
+make_cor_label <- function(
+  data,
+  x,
+  y
+) {
+
+  res <- spearman_test(
+    data,
+    x,
+    y
+  )
+
+  if (is.na(res$spearman_rho)) {
+    return("")
+  }
+
+  sprintf(
+    "Spearman rho = %.2f\nP = %.3g",
+    res$spearman_rho,
+    res$p_value
+  )
+}
+
+# ============================================================
+# correlations
+# ============================================================
+
+corr_table <- bind_rows(
+
+  spearman_test(
+    df,
+    "Rloop_strand_event_density_per_100Mb",
+    "Rloop_union_coverage_percent"
+  ),
+
+  spearman_test(
+    df,
+    "Rloop_strand_event_mean_length",
+    "Rloop_union_coverage_percent"
+  ),
+
+  spearman_test(
+    df,
+    "main_chr_size_Gb",
+    "Rloop_union_coverage_percent"
+  ),
+
+  spearman_test(
+    df,
+    "gene_density_per_Mb",
+    "Rloop_union_coverage_percent"
+  ),
+
+  spearman_test(
+    df,
+    "GC_content_percent",
+    "Rloop_union_coverage_percent"
+  )
+)
+
+write_tsv(
+  corr_table,
+  file.path(
+    outdir,
+    "spearman_correlation_summary.tsv"
+  )
+)
+
+# ============================================================
+# 1. Union coverage
+# ============================================================
+
+df_cov <- df %>%
+  arrange(Rloop_union_coverage_percent) %>%
+  mutate(
+    species_label = factor(
+      species_label,
+      levels = species_label
+    )
+  )
+
+p1 <- ggplot(
+  df_cov,
+  aes(
+    x = Rloop_union_coverage_percent,
+    y = species_label,
+    fill = lineage
+  )
+) +
+  geom_col() +
+  labs(
+    title = "Genome-wide R-loop coverage across legume species",
+    x = "Union R-loop coverage (%)",
+    y = "Species",
+    fill = "Lineage"
+  ) +
+  theme(
+    axis.text.y =
+      element_text(size = 9)
+  )
+
+save_pair(
+  p1,
+  "01_species_union_coverage",
+  width = 10,
+  height = 9
+)
+
+# ============================================================
+# 2. Strand-specific event density
+# ============================================================
+
+df_density <- df %>%
+  arrange(
+    Rloop_strand_event_density_per_100Mb
+  ) %>%
+  mutate(
+    species_label = factor(
+      species_label,
+      levels = species_label
+    )
+  )
+
+p2 <- ggplot(
+  df_density,
+  aes(
+    x =
+      Rloop_strand_event_density_per_100Mb,
+    y = species_label,
+    fill = lineage
+  )
+) +
+  geom_col() +
+  labs(
+    title =
+      "Strand-specific R-loop event density across legume species",
+    x =
+      "R-loop events per 100 Mb",
+    y = "Species",
+    fill = "Lineage"
+  ) +
+  theme(
+    axis.text.y =
+      element_text(size = 9)
+  )
+
+save_pair(
+  p2,
+  "02_species_event_density",
+  width = 10,
+  height = 9
+)
+
+# ============================================================
+# 3. Mean event length
+# ============================================================
+
+df_len <- df %>%
+  arrange(
+    Rloop_strand_event_mean_length
+  ) %>%
+  mutate(
+    species_label = factor(
+      species_label,
+      levels = species_label
+    )
+  )
+
+p3 <- ggplot(
+  df_len,
+  aes(
+    x =
+      Rloop_strand_event_mean_length,
+    y = species_label,
+    fill = lineage
+  )
+) +
+  geom_col() +
+  labs(
+    title =
+      "Mean strand-specific R-loop event length",
+    x =
+      "Mean R-loop event length (bp)",
+    y = "Species",
+    fill = "Lineage"
+  ) +
+  theme(
+    axis.text.y =
+      element_text(size = 9)
+  )
+
+save_pair(
+  p3,
+  "03_species_event_mean_length",
+  width = 10,
+  height = 9
+)
+
+# ============================================================
+# 4. Event density vs union coverage
+# ============================================================
+
+p4 <- ggplot(
+  df,
+  aes(
+    x =
+      Rloop_strand_event_density_per_100Mb,
+    y =
+      Rloop_union_coverage_percent,
+    color = lineage
+  )
+) +
+  geom_point(
+    size = 3.2,
+    alpha = 0.9
+  ) +
+  annotate(
+    "text",
+    x = -Inf,
+    y = Inf,
+    label = make_cor_label(
+      df,
+      "Rloop_strand_event_density_per_100Mb",
+      "Rloop_union_coverage_percent"
+    ),
+    hjust = -0.05,
+    vjust = 1.2,
+    size = 3.5
+  ) +
+  labs(
+    title =
+      "R-loop event density vs genomic coverage",
+    x =
+      "R-loop events per 100 Mb",
+    y =
+      "Union R-loop coverage (%)",
+    color = "Lineage"
+  )
+
+p4 <- add_species_labels(
+  p4,
+  df
+)
+
+save_pair(
+  p4,
+  "04_event_density_vs_union_coverage",
+  width = 9,
+  height = 7
+)
+
+# ============================================================
+# 5. Mean event length vs union coverage
+# ============================================================
+
+p5 <- ggplot(
+  df,
+  aes(
+    x =
+      Rloop_strand_event_mean_length,
+    y =
+      Rloop_union_coverage_percent,
+    color = lineage
+  )
+) +
+  geom_point(
+    size = 3.2,
+    alpha = 0.9
+  ) +
+  annotate(
+    "text",
+    x = -Inf,
+    y = Inf,
+    label = make_cor_label(
+      df,
+      "Rloop_strand_event_mean_length",
+      "Rloop_union_coverage_percent"
+    ),
+    hjust = -0.05,
+    vjust = 1.2,
+    size = 3.5
+  ) +
+  labs(
+    title =
+      "R-loop event length vs genomic coverage",
+    x =
+      "Mean R-loop event length (bp)",
+    y =
+      "Union R-loop coverage (%)",
+    color = "Lineage"
+  )
+
+p5 <- add_species_labels(
+  p5,
+  df
+)
+
+save_pair(
+  p5,
+  "05_event_mean_length_vs_union_coverage",
+  width = 9,
+  height = 7
+)
+
+# ============================================================
+# 6. Genome size vs union coverage
+#
+# 只保留main chromosome size；
+# 使用log10，避免Vicia faba拉伸坐标。
+# ============================================================
+
+df_size <- df %>%
+  filter(
+    !is.na(main_chr_size_Gb),
+    main_chr_size_Gb > 0
+  )
+
+p6 <- ggplot(
+  df_size,
+  aes(
+    x = main_chr_size_Gb,
+    y =
+      Rloop_union_coverage_percent,
+    color = lineage
+  )
+) +
+  geom_point(
+    size = 3.2,
+    alpha = 0.9
+  ) +
+  scale_x_log10() +
+  annotate(
+    "text",
+    x = -Inf,
+    y = Inf,
+    label = make_cor_label(
+      df_size,
+      "main_chr_size_Gb",
+      "Rloop_union_coverage_percent"
+    ),
+    hjust = -0.05,
+    vjust = 1.2,
+    size = 3.5
+  ) +
+  labs(
+    title =
+      "Genome size vs R-loop coverage",
+    subtitle =
+      "Main chromosome size; x-axis in log10 scale",
+    x =
+      "Main chromosome size (Gb, log10 scale)",
+    y =
+      "Union R-loop coverage (%)",
+    color = "Lineage"
+  )
+
+p6 <- add_species_labels(
+  p6,
+  df_size
+)
+
+save_pair(
+  p6,
+  "06_genome_size_vs_union_coverage",
+  width = 9,
+  height = 7
+)
+
+# ============================================================
+# 7. Gene density vs union coverage
+# ============================================================
+
+df_gene <- df %>%
+  filter(
+    !is.na(gene_density_per_Mb)
+  )
+
+if (nrow(df_gene) >= 3) {
+
+  p7 <- ggplot(
+    df_gene,
+    aes(
+      x =
+        gene_density_per_Mb,
+      y =
+        Rloop_union_coverage_percent,
+      color = lineage
+    )
+  ) +
+    geom_point(
+      size = 3.2,
+      alpha = 0.9
+    ) +
+    annotate(
+      "text",
+      x = -Inf,
+      y = Inf,
+      label = make_cor_label(
+        df_gene,
+        "gene_density_per_Mb",
+        "Rloop_union_coverage_percent"
+      ),
+      hjust = -0.05,
+      vjust = 1.2,
+      size = 3.5
+    ) +
+    labs(
+      title =
+        "Gene density vs R-loop coverage",
+      x =
+        "Gene density (genes/Mb)",
+      y =
+        "Union R-loop coverage (%)",
+      color = "Lineage"
+    )
+
+  p7 <- add_species_labels(
+    p7,
+    df_gene
+  )
+
+  save_pair(
+    p7,
+    "07_gene_density_vs_union_coverage",
+    width = 9,
+    height = 7
+  )
+}
+
+# ============================================================
+# 8. GC content vs union coverage
+#
+# 当前如果GC全为NA则自动跳过。
+# ============================================================
+
+df_gc <- df %>%
+  filter(
+    !is.na(GC_content_percent)
+  )
+
+if (nrow(df_gc) >= 3) {
+
+  p8 <- ggplot(
+    df_gc,
+    aes(
+      x =
+        GC_content_percent,
+      y =
+        Rloop_union_coverage_percent,
+      color = lineage
+    )
+  ) +
+    geom_point(
+      size = 3.2,
+      alpha = 0.9
+    ) +
+    annotate(
+      "text",
+      x = -Inf,
+      y = Inf,
+      label = make_cor_label(
+        df_gc,
+        "GC_content_percent",
+        "Rloop_union_coverage_percent"
+      ),
+      hjust = -0.05,
+      vjust = 1.2,
+      size = 3.5
+    ) +
+    labs(
+      title =
+        "GC content vs R-loop coverage",
+      x =
+        "GC content (%)",
+      y =
+        "Union R-loop coverage (%)",
+      color = "Lineage"
+    )
+
+  p8 <- add_species_labels(
+    p8,
+    df_gc
+  )
+
+  save_pair(
+    p8,
+    "08_gc_content_vs_union_coverage",
+    width = 9,
+    height = 7
+  )
+
+} else {
+
+  message(
+    "[INFO] GC_content_main_chr有效数据不足，跳过GC图。"
+  )
+}
+
+# ============================================================
+# 9. fwd/rev overlap QC
+# ============================================================
+
+overlap <- read_tsv(
+  overlap_file,
+  show_col_types = FALSE,
+  locale = locale(encoding = "UTF-8")
+)
+
+required_overlap <- c(
+  "species",
+  "fwd_overlap_frac",
+  "rev_overlap_frac",
+  "intersection_bp",
+  "union_bp",
+  "jaccard"
+)
+
+missing_overlap <- setdiff(
+  required_overlap,
+  colnames(overlap)
+)
+
+if (length(missing_overlap) > 0) {
+
+  stop(
+    "overlap表缺少必要列: ",
+    paste(
+      missing_overlap,
+      collapse = ", "
+    )
+  )
+}
+
+overlap <- overlap %>%
+  mutate(
+    across(
+      c(
+        fwd_overlap_frac,
+        rev_overlap_frac,
+        intersection_bp,
+        union_bp,
+        jaccard
+      ),
+      as.numeric
+    )
+  ) %>%
+  left_join(
+    df %>%
+      select(
+        species,
+        species_label,
+        lineage
+      ),
+    by = "species"
+  ) %>%
+  mutate(
+
+    mean_peak_overlap_frac =
+      (
+        fwd_overlap_frac +
+        rev_overlap_frac
+      ) / 2,
+
+    mean_peak_overlap_percent =
+      mean_peak_overlap_frac * 100,
+
+    jaccard_percent =
+      jaccard * 100
+  )
+
+write_tsv(
+  overlap,
+  file.path(
+    outdir,
+    "fwd_rev_overlap_plot_cleaned.tsv"
+  )
+)
+
+# 两种不同含义的overlap指标放在一个figure的两个panel中
+
+overlap_long <- bind_rows(
+
+  overlap %>%
+    transmute(
+      species_label,
+      lineage,
+      metric =
+        "Peak-level opposite-strand overlap",
+      value_percent =
+        mean_peak_overlap_percent
+    ),
+
+  overlap %>%
+    transmute(
+      species_label,
+      lineage,
+      metric =
+        "Base-pair Jaccard similarity",
+      value_percent =
+        jaccard_percent
+    )
+)
+
+species_order_overlap <- overlap %>%
+  arrange(
+    mean_peak_overlap_percent
+  ) %>%
+  pull(species_label)
+
+overlap_long <- overlap_long %>%
+  mutate(
+    species_label =
+      factor(
+        species_label,
+        levels =
+          species_order_overlap
+      )
+  )
+
+p9 <- ggplot(
+  overlap_long,
+  aes(
+    x = value_percent,
+    y = species_label,
+    color = lineage
+  )
+) +
+  geom_point(
+    size = 3,
+    alpha = 0.9
+  ) +
+  facet_wrap(
+    ~ metric,
+    ncol = 1,
+    scales = "free_x"
+  ) +
+  labs(
+    title =
+      "Spatial overlap between forward- and reverse-strand R-loop predictions",
+    x =
+      "Overlap metric (%)",
+    y =
+      "Species",
+    color =
+      "Lineage"
+  ) +
+  theme(
+    axis.text.y =
+      element_text(size = 8.5),
+    strip.text =
+      element_text(face = "bold")
+  )
+
+save_pair(
+  p9,
+  "09_fwd_rev_spatial_overlap",
+  width = 10,
+  height = 11
+)
+
+# ============================================================
+# overlap descriptive statistics
+# ============================================================
+
+overlap_stats <- overlap %>%
+  summarise(
+    species_n = n(),
+
+    peak_overlap_mean =
+      mean(
+        mean_peak_overlap_frac,
+        na.rm = TRUE
+      ),
+
+    peak_overlap_median =
+      median(
+        mean_peak_overlap_frac,
+        na.rm = TRUE
+      ),
+
+    peak_overlap_min =
+      min(
+        mean_peak_overlap_frac,
+        na.rm = TRUE
+      ),
+
+    peak_overlap_max =
+      max(
+        mean_peak_overlap_frac,
+        na.rm = TRUE
+      ),
+
+    jaccard_mean =
+      mean(
+        jaccard,
+        na.rm = TRUE
+      ),
+
+    jaccard_median =
+      median(
+        jaccard,
+        na.rm = TRUE
+      ),
+
+    jaccard_min =
+      min(
+        jaccard,
+        na.rm = TRUE
+      ),
+
+    jaccard_max =
+      max(
+        jaccard,
+        na.rm = TRUE
+      )
+  )
+
+write_tsv(
+  overlap_stats,
+  file.path(
+    outdir,
+    "fwd_rev_overlap_descriptive_stats.tsv"
+  )
+)
+
+cat("\n完成。\n")
+cat(
+  "主表: ",
+  normalizePath(summary_file),
+  "\n",
+  sep = ""
+)
+cat(
+  "overlap表: ",
+  normalizePath(overlap_file),
+  "\n",
+  sep = ""
+)
+cat(
+  "输出目录: ",
+  normalizePath(outdir),
+  "\n",
+  sep = ""
+)
+
+conda activate tidyverse
+Rscript plot_rloop_both_union_final.R \
+  genedata_rloop_summary_both_union.tsv \
+  fwd_rev_overlap/fwd_rev_overlap_summary.tsv \
+  rloop_plots_both_union
