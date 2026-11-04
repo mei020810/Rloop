@@ -1020,3 +1020,71 @@ grep -v '^>' \
 | grep '\*' | head
 ls 03_proteomes/protein/*.protein.fa | wc -l
 find 03_proteomes/protein -name "*.protein.fa" -size 0
+#重新生成05_annotation_qc.tsv
+PRODIR="03_proteomes/protein"
+BUSCODIR="04_busco_protein"
+OUT="05_annotation_qc.tsv"
+
+echo -e "Species\tProtein_n\tMean_length\tMedian_length\tMax_length\tLT50_n\tLT50_pct\tLT100_n\tLT100_pct\tBUSCO_C\tBUSCO_S\tBUSCO_D\tBUSCO_F\tBUSCO_M\tBUSCO_n" > "$OUT"
+
+for protein in "$PRODIR"/*.protein.fa; do
+
+    sample=$(basename "$protein" .protein.fa)
+    tmp=$(mktemp)
+
+    seqkit fx2tab -n -l "$protein" | cut -f2 > "$tmp"
+
+    n=$(wc -l < "$tmp")
+    mean=$(awk '{s+=$1} END{printf "%.1f",s/NR}' "$tmp")
+    median=$(sort -n "$tmp" | awk '{a[NR]=$1} END{
+        if(NR%2) print a[(NR+1)/2];
+        else printf "%.1f",(a[NR/2]+a[NR/2+1])/2
+    }')
+    max=$(sort -nr "$tmp" | head -1)
+
+    lt50=$(awk '$1<50{n++} END{print n+0}' "$tmp")
+    lt100=$(awk '$1<100{n++} END{print n+0}' "$tmp")
+
+    lt50pct=$(awk -v a="$lt50" -v n="$n" 'BEGIN{printf "%.1f",a/n*100}')
+    lt100pct=$(awk -v a="$lt100" -v n="$n" 'BEGIN{printf "%.1f",a/n*100}')
+
+    summary=$(ls "$BUSCODIR/$sample"/short_summary*.txt 2>/dev/null | head -1)
+
+    line=$(grep -m1 'C:' "$summary")
+
+    C=$(echo "$line" | sed -n 's/.*C:\([0-9.]*\)%.*/\1/p')
+    S=$(echo "$line" | sed -n 's/.*S:\([0-9.]*\)%.*/\1/p')
+    D=$(echo "$line" | sed -n 's/.*D:\([0-9.]*\)%.*/\1/p')
+    F=$(echo "$line" | sed -n 's/.*F:\([0-9.]*\)%.*/\1/p')
+    M=$(echo "$line" | sed -n 's/.*M:\([0-9.]*\)%.*/\1/p')
+    N=$(echo "$line" | sed -n 's/.*n:\([0-9]*\).*/\1/p')
+
+    echo -e "$sample\t$n\t$mean\t$median\t$max\t$lt50\t$lt50pct\t$lt100\t$lt100pct\t$C\t$S\t$D\t$F\t$M\t$N" >> "$OUT"
+
+    rm -f "$tmp"
+done
+column -t 05_annotation_qc.tsv | less -S
+wc -l 05_annotation_qc.tsv
+
+#有5个物种蛋白的busco结果比较差，给orthofinder的输入文件建立软链接
+mkdir -p 06_orthofinder/input_75
+for f in 03_proteomes/protein/*.protein.fa; do
+
+    sample=$(basename "$f" .protein.fa)
+
+    case "$sample" in
+        Hoita_strobilina_GCA_054297685.1|\
+        Eurypetalum_unijugum_GCA_052075625.1|\
+        Retama_dasycarpa_GCA_047404355.1|\
+        Vachellia_collinsii_GCA_006871305.1|\
+        Eperua_duckeana_GCA_055187795.1)
+            continue
+            ;;
+    esac
+
+    species=$(echo "$sample" | cut -d_ -f1-2)
+
+    ln -sf "$(realpath "$f")" \
+        "06_orthofinder/input_75/${species}.fa"
+done
+ls 06_orthofinder/input_75/*.fa | wc -l
