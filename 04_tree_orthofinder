@@ -1088,3 +1088,1290 @@ for f in 03_proteomes/protein/*.protein.fa; do
         "06_orthofinder/input_75/${species}.fa"
 done
 ls 06_orthofinder/input_75/*.fa | wc -l
+
+#########
+#########老师说网上有注释文件的可以换网上的，看看busco效果
+mkdir -p 03_public_annotation/gff 03_public_annotation/protein
+#收集到37个gff和35个pro文件，先看看看pro文件的busco效果
+conda activate busco6
+mkdir -p 03_public_annotation/busco_protein/logs
+PRODIR="03_public_annotation/protein"
+OUTDIR="03_public_annotation/busco_protein"
+LINEAGE="01_busco_db/lineages/fabales_odb12.2"
+
+for p in "$PRODIR"/*; do
+
+    base=$(basename "$p")
+    sample="${base%%.protein*}"
+
+    echo "Processing: $sample"
+
+    if ls "$OUTDIR/$sample"/short_summary*.txt >/dev/null 2>&1; then
+        echo "[SKIP] $sample"
+        continue
+    fi
+
+    busco \
+      -i "$p" \
+      -m proteins \
+      -l "$LINEAGE" \
+      --offline \
+      -o "$sample" \
+      --out_path "$OUTDIR" \
+      -c 16 \
+      > "$OUTDIR/logs/${sample}.log" 2>&1
+
+done
+##Piptanthus的busco结果比helixer的差，且该物种的gff和他配套的基因组有些匹配不上，直接用回helixer的
+#有两个物种只有gff文件，用agat翻译为pro文件
+conda activate agat
+sample="Anthyllis_vulneraria_GCA_965615755.1"
+agat_sp_extract_sequences.pl \
+  -g 03_public_annotation/gff/${sample}.ensembl.gff3 \
+  -f 00_genomes/genomes_fasta/${sample}.fna \
+  -t cds \
+  -p \
+  -o 03_public_annotation/protein/${sample}.protein.fa
+sample="Cyamopsis_tetragonoloba_GCA_037177725.1"
+agat_sp_extract_sequences.pl \
+  -g 03_public_annotation/gff/${sample}.CTGA.gff3 \
+  -f 00_genomes/genomes_fasta/${sample}.fna \
+  -t cds \
+  -p \
+  -o 03_public_annotation/protein/${sample}.protein.fa
+seqkit stats \
+03_public_annotation/protein/Anthyllis_vulneraria_GCA_965615755.1.protein.fa \
+03_public_annotation/protein/Cyamopsis_tetragonoloba_GCA_037177725.1.protein.fa
+#这里看到A的蛋白数量为288，C的数量为7w多，检查一下注释文件中的gff的mRNA和gene数量
+grep -v '^#' \
+03_public_annotation/gff/Anthyllis_vulneraria_GCA_965615755.1.ensembl.gff3 \
+| cut -f3 | sort | uniq -c | sort -nr | head -20
+grep -v '^#' \
+03_public_annotation/gff/Cyamopsis_tetragonoloba_GCA_037177725.1.CTGA.gff3 \
+| cut -f3 | sort | uniq -c | sort -nr | head -20
+#C的mRNA数量就是七万多，继续busco看看
+conda activate busco6
+busco \
+  -i 03_public_annotation/protein/Cyamopsis_tetragonoloba_GCA_037177725.1.protein.fa \
+  -m proteins \
+  -l 01_busco_db/lineages/fabales_odb12.2 \
+  --offline \
+  -o Cyamopsis_tetragonoloba_GCA_037177725.1 \
+  --out_path 03_public_annotation/busco_protein \
+  -c 16
+#A的检查gff和genome的染色体是否一致
+FA="00_genomes/genomes_fasta/Anthyllis_vulneraria_GCA_965615755.1.fna"
+GFF="03_public_annotation/gff/Anthyllis_vulneraria_GCA_965615755.1.ensembl.gff3"
+grep '^>' "$FA" | sed 's/^>//;s/ .*//' | sort -u > /tmp/fa.ids
+awk '!/^#/ {print $1}' "$GFF" | sort -u > /tmp/gff.ids
+echo "GFF中有、FASTA中没有："
+comm -23 /tmp/gff.ids /tmp/fa.ids | head -20
+wc -l /tmp/fa.ids /tmp/gff.ids
+#A的genome文件跟gff的染色体命名不同，直接更换gff对应的genome重跑agat
+sample="Anthyllis_vulneraria_GCA_965615755.1"
+agat_sp_extract_sequences.pl \
+  -g 03_public_annotation/gff/${sample}.ensembl.gff3 \
+  -f 00_genomes/Anthyllis_vulneraria_GCA_965615755.1.ensembl.fa \
+  -t cds \
+  -p \
+  -o 03_public_annotation/protein/${sample}.protein.fa
+seqkit stats 03_public_annotation/protein/${sample}.protein.fa  #pro数值跟gene数目相近
+
+##重新整理到了47个gff
+#考虑到后面需要用基因组进行deeprloop预测，批量看gff能不能跟基因组对上
+GFFDIR="03_public_annotation/gff"
+PUBGENOME="03_public_annotation/genome"
+GENOME00="00_genomes/genomes_fasta"
+OUT="03_public_annotation/gff_genome_id_check.tsv"
+
+echo -e "Sample\tGFF\tGenome\tGFF_IDs\tGenome_IDs\tShared\tGFF_only\tStatus" > "$OUT"
+
+for gff in "$GFFDIR"/*.gff "$GFFDIR"/*.gff3; do
+    [ -e "$gff" ] || continue
+
+    base=$(basename "$gff")
+    sample=${base%.gff}
+    sample=${sample%.gff3}
+
+    genome=""
+
+    # 1. 优先找配套下载的 public genome
+    for ext in fa fasta fna fas; do
+        if [ -f "$PUBGENOME/${sample}.${ext}" ]; then
+            genome="$PUBGENOME/${sample}.${ext}"
+            break
+        fi
+    done
+
+    # 2. 没有的话，用属名+种名到 00_genomes 找
+    if [ -z "$genome" ]; then
+        species=$(echo "$sample" | cut -d_ -f1-2)
+        genome=$(find -L "$GENOME00" -maxdepth 1 -type f -name "${species}_*.fna" | head -1)
+    fi
+
+    if [ -z "$genome" ]; then
+        echo -e "$sample\t$gff\tNA\tNA\tNA\tNA\tNA\tNO_GENOME" >> "$OUT"
+        continue
+    fi
+
+    awk '!/^#/ {print $1}' "$gff" | sort -u > /tmp/gff.ids
+    grep '^>' "$genome" | sed 's/^>//;s/[[:space:]].*//' | sort -u > /tmp/fa.ids
+
+    ngff=$(wc -l < /tmp/gff.ids)
+    nfa=$(wc -l < /tmp/fa.ids)
+    shared=$(comm -12 /tmp/gff.ids /tmp/fa.ids | wc -l)
+    missing=$(comm -23 /tmp/gff.ids /tmp/fa.ids | wc -l)
+
+    if [ "$missing" -eq 0 ]; then
+        status="PASS"
+    elif [ "$shared" -eq 0 ]; then
+        status="FAIL"
+    else
+        status="PARTIAL"
+    fi
+
+    echo -e "$sample\t$gff\t$genome\t$ngff\t$nfa\t$shared\t$missing\t$status" >> "$OUT"
+done
+#查看
+column -t 03_public_annotation/gff_genome_id_check.tsv | less -S
+awk -F'\t' 'NR==1 || $8!="PASS"' \
+03_public_annotation/gff_genome_id_check.tsv |
+column -t
+#有3个可以提取蛋白文件
+sample="Astragalus_membranaceus_figshare"
+agat_sp_extract_sequences.pl \
+  -g 03_public_annotation/gff/${sample}.gff3 \
+  -f 03_public_annotation/genome/${sample}.fasta \
+  -t cds \
+  -p \
+  -o 03_public_annotation/protein/${sample}.protein.fa
+
+sample="Anthyllis_vulneraria_ensembl"
+agat_sp_extract_sequences.pl \
+  -g 03_public_annotation/gff/${sample}.gff3 \
+  -f 03_public_annotation/genome/${sample}.fa \
+  -t cds \
+  -p \
+  -o 03_public_annotation/protein/${sample}.protein.fa
+
+agat_sp_extract_sequences.pl \
+  -g 03_public_annotation/gff/Cyamopsis_tetragonoloba_CTGA.gff3 \
+  -f 00_genomes/genomes_fasta/Cyamopsis_tetragonoloba_GCA_037177725.1.fna \
+  -t cds \
+  -p \
+  -o 03_public_annotation/protein/Cyamopsis_tetragonoloba_CTGA.protein.fa
+#统一位置
+seqkit stats \
+03_public_annotation/protein/Anthyllis_vulneraria_ensembl.protein.fa \
+03_public_annotation/protein/Astragalus_membranaceus_figshare.protein.fa \
+03_public_annotation/protein/Cyamopsis_tetragonoloba_CTGA.protein.fa
+#看看有些物种少量id没匹配上是啥情况
+GFF="03_public_annotation/gff/Zenia_insignis_sdb.gff3"
+FA="03_public_annotation/genome/Zenia_insignis_sdb.fas"
+awk '!/^#/ {print $1}' "$GFF" | sort -u > /tmp/z.gff
+grep '^>' "$FA" | sed 's/^>//;s/[[:space:]].*//' | sort -u > /tmp/z.fa
+echo "GFF only:"
+comm -23 /tmp/z.gff /tmp/z.fa
+echo "Genome only:"
+comm -13 /tmp/z.gff /tmp/z.fa | head -20
+#看看这里有啥
+miss=$(comm -23 /tmp/z.gff /tmp/z.fa | head -1)
+awk -v id="$miss" '
+$1==id {c[$3]++}
+END {for(i in c) print i,c[i]}
+' "$GFF"
+#看这几个物种情况
+for x in \
+Glycyrrhiza_uralensis_GWHHCNU00000000.1 \
+Mimosa_bimucronata_GWHDODZ00000000 \
+Stylosanthes_angustifolia_GWHFHGI00000000.1 \
+Zenia_insignis_sdb
+do
+    gff=$(ls 03_public_annotation/gff/${x}.*)
+    fa=$(ls 03_public_annotation/genome/${x}.*)
+
+    awk '!/^#/ {print $1}' "$gff" | sort -u > /tmp/gff.ids
+    grep '^>' "$fa" | sed 's/^>//;s/[[:space:]].*//' | sort -u > /tmp/fa.ids
+
+    echo "===== $x ====="
+    echo "GFF only:"
+    comm -23 /tmp/gff.ids /tmp/fa.ids
+done
+
+GFF="03_public_annotation/gff/Dalbergia_cochinchinensis_wp.gff"
+FA="03_public_annotation/genome/Dalbergia_cochinchinensis_wp.fa"
+awk '!/^#/ {print $1}' "$GFF" | sort -u | head -20
+grep '^>' "$FA" | head -20
+
+GFF="03_public_annotation/gff/Pterocarpus_macrocarpus_wp.gff"
+FA="03_public_annotation/genome/Pterocarpus_macrocarpus_wp.fa"
+awk '!/^#/ {print $1}' "$GFF" | sort -u | head -20
+grep '^>' "$FA" | head -20
+#Dalbergia和Pterocarpus可以生成对应表
+FA="03_public_annotation/genome/Dalbergia_cochinchinensis_wp.fa"
+GFF="03_public_annotation/gff/Dalbergia_cochinchinensis_wp.gff"
+MAP="/tmp/dalbergia.map"
+grep '^>' "$FA" | sed 's/^>//' | awk '
+{
+    id=$1
+
+    if ($0 ~ /chromosome [0-9]+/) {
+        match($0,/chromosome [0-9]+/)
+        x=substr($0,RSTART,RLENGTH)
+        sub("chromosome ","",x)
+        print "Chr"x"\t"id
+    }
+
+    else if ($0 ~ /seq[0-9]+/) {
+        match($0,/seq[0-9]+/)
+        x=substr($0,RSTART,RLENGTH)
+        sub("seq","",x)
+        print "unplaced_scaffold"x"\t"id
+    }
+}' > "$MAP"
+#保证所有gff id都能对应，无输出即可转换
+awk 'NR==FNR{m[$1]=$2;next}
+!/^#/ && !($1 in m){print $1}' \
+"$MAP" "$GFF" | sort -u
+awk 'BEGIN{OFS="\t"}
+NR==FNR{m[$1]=$2;next}
+/^#/{print;next}
+{
+    if($1 in m) $1=m[$1]
+    print
+}' "$MAP" "$GFF" \
+> 03_public_annotation/gff/Dalbergia_cochinchinensis_wp.fixed.gff
+
+FA="03_public_annotation/genome/Pterocarpus_macrocarpus_wp.fa"
+GFF="03_public_annotation/gff/Pterocarpus_macrocarpus_wp.gff"
+MAP="/tmp/pterocarpus.map"
+grep '^>' "$FA" | sed 's/^>//' | awk '
+{
+    id=$1
+
+    if ($0 ~ /chromosome [0-9]+/) {
+        match($0,/chromosome [0-9]+/)
+        x=substr($0,RSTART,RLENGTH)
+        sub("chromosome ","",x)
+        print "Chr"x"\t"id
+    }
+
+    else if ($0 ~ /seq[0-9]+/) {
+        match($0,/seq[0-9]+/)
+        x=substr($0,RSTART,RLENGTH)
+        sub("seq","",x)
+        print "unplaced_scaffold"x"\t"id
+    }
+}' > "$MAP"
+awk 'BEGIN{OFS="\t"}
+NR==FNR{m[$1]=$2;next}
+/^#/{print;next}
+{
+    if($1 in m) $1=m[$1]
+    print
+}' "$MAP" "$GFF" \
+> 03_public_annotation/gff/Pterocarpus_macrocarpus_wp.fixed.gff
+#对上面D和P两个物种，每个gene保留一个最长的做代表transcript，并提取蛋白
+mkdir -p \
+03_public_annotation/gff_1gene1isoform \
+03_public_annotation/protein_1gene1protein
+agat_sp_keep_longest_isoform.pl \
+  --gff 03_public_annotation/gff/Dalbergia_cochinchinensis_wp.fixed.gff \
+  -o 03_public_annotation/gff_1gene1isoform/Dalbergia_cochinchinensis_wp.gff
+agat_sp_extract_sequences.pl \
+  -g 03_public_annotation/gff_1gene1isoform/Dalbergia_cochinchinensis_wp.gff \
+  -f 03_public_annotation/genome/Dalbergia_cochinchinensis_wp.fa \
+  -t cds \
+  -p \
+  -o 03_public_annotation/protein_1gene1protein/Dalbergia_cochinchinensis_wp.protein.fa
+agat_sp_keep_longest_isoform.pl \
+  --gff 03_public_annotation/gff/Pterocarpus_macrocarpus_wp.fixed.gff \
+  -o 03_public_annotation/gff_1gene1isoform/Pterocarpus_macrocarpus_wp.gff
+agat_sp_extract_sequences.pl \
+  -g 03_public_annotation/gff_1gene1isoform/Pterocarpus_macrocarpus_wp.gff \
+  -f 03_public_annotation/genome/Pterocarpus_macrocarpus_wp.fa \
+  -t cds \
+  -p \
+  -o 03_public_annotation/protein_1gene1protein/Pterocarpus_macrocarpus_wp.protein.fa
+seqkit stats \
+03_public_annotation/protein_1gene1protein/Dalbergia_cochinchinensis_wp.protein.fa \
+03_public_annotation/protein_1gene1protein/Pterocarpus_macrocarpus_wp.protein.fa
+#查看longest GFF 里 transcript 数量，gene与pro数相近
+for s in Dalbergia_cochinchinensis_wp Pterocarpus_macrocarpus_wp
+do
+    echo "===== $s ====="
+
+    awk '$3=="gene"{g++}
+         $3=="mRNA" || $3=="transcript"{t++}
+         $3=="CDS"{c++}
+         END{print "gene",g,"transcript",t,"CDS",c}' \
+    03_public_annotation/gff_1gene1isoform/${s}.gff
+
+    echo -n "protein "
+    grep -c '^>' \
+    03_public_annotation/protein_1gene1protein/${s}.protein.fa
+done
+
+mkdir -p \
+03_public_annotation/gff_1gene1isoform \
+03_public_annotation/protein_1gene1protein \
+03_public_annotation/logs_1gene1protein
+TABLE="03_public_annotation/gff_genome_id_check.tsv"
+GFFOUT="03_public_annotation/gff_1gene1isoform"
+PROOUT="03_public_annotation/protein_1gene1protein"
+LOGDIR="03_public_annotation/logs_1gene1protein"
+
+while IFS=$'\t' read -r sample gff genome gff_ids genome_ids shared gff_only status
+do
+    [ "$sample" = "Sample" ] && continue
+
+    # Zenia不处理
+    [ "$sample" = "Zenia_insignis_sdb" ] && continue
+
+    # PASS直接处理；这3个后来人工确认也已经匹配
+    if [ "$status" != "PASS" ] &&
+       [ "$sample" != "Glycyrrhiza_uralensis_GWHHCNU00000000.1" ] &&
+       [ "$sample" != "Mimosa_bimucronata_GWHDODZ00000000" ] &&
+       [ "$sample" != "Stylosanthes_angustifolia_GWHFHGI00000000.1" ]; then
+        continue
+    fi
+
+    outgff="${GFFOUT}/${sample}.gff"
+    outpro="${PROOUT}/${sample}.protein.fa"
+    log="${LOGDIR}/${sample}.log"
+
+    if [ -s "$outpro" ]; then
+        echo "[SKIP] $sample"
+        continue
+    fi
+
+    echo "[START] $sample"
+
+    agat_sp_keep_longest_isoform.pl \
+        --gff "$gff" \
+        -o "$outgff" \
+        > "$log" 2>&1
+
+    agat_sp_extract_sequences.pl \
+        -g "$outgff" \
+        -f "$genome" \
+        -t cds \
+        -p \
+        -o "$outpro" \
+        >> "$log" 2>&1
+
+    echo "[OK] $sample"
+done < "$TABLE"
+ls 03_public_annotation/protein_1gene1protein/*.protein.fa | wc -l
+seqkit stats 03_public_annotation/protein_1gene1protein/*.protein.fa
+#简易表格
+OUT="03_public_annotation/public_1gene1protein_qc.tsv"
+
+echo -e "Sample\tGene_n\tTranscript_n\tProtein_n" > "$OUT"
+
+for p in 03_public_annotation/protein_1gene1protein/*.protein.fa
+do
+    sample=$(basename "$p" .protein.fa)
+    gff="03_public_annotation/gff_1gene1isoform/${sample}.gff"
+
+    gene=$(awk '$3=="gene"{n++} END{print n+0}' "$gff")
+
+    transcript=$(awk '
+    $3=="mRNA" || $3=="transcript"{n++}
+    END{print n+0}' "$gff")
+
+    protein=$(grep -c '^>' "$p")
+
+    echo -e "${sample}\t${gene}\t${transcript}\t${protein}" >> "$OUT"
+done
+column -t 03_public_annotation/public_1gene1protein_qc.tsv | less -S
+#lablab的有异常，把fasta文件重新换行
+seqkit seq -w 60 \
+03_public_annotation/genome/Lablab_purpureus_LIS.fna \
+> 03_public_annotation/genome/Lablab_purpureus_LIS.wrap60.fna
+#检查最长行，应为60
+awk '{if(length($0)>m)m=length($0)} END{print m}' \
+03_public_annotation/genome/Lablab_purpureus_LIS.wrap60.fna
+#重提蛋白
+rm -f \
+03_public_annotation/protein_1gene1protein/Lablab_purpureus_LIS.protein.fa
+
+agat_sp_extract_sequences.pl \
+  -g 03_public_annotation/gff_1gene1isoform/Lablab_purpureus_LIS.gff \
+  -f 03_public_annotation/genome/Lablab_purpureus_LIS.wrap60.fna \
+  -t cds \
+  -p \
+  -o 03_public_annotation/protein_1gene1protein/Lablab_purpureus_LIS.protein.fa
+#检查
+seqkit stats \
+03_public_annotation/protein_1gene1protein/Lablab_purpureus_LIS.protein.fa
+grep -c '^>' \
+03_public_annotation/protein_1gene1protein/Lablab_purpureus_LIS.protein.fa
+#检查其他物种有没这种情况
+for f in 03_public_annotation/genome/*; do max=$(awk '{if(length($0)>m)m=length($0)} END{print m+0}' "$f"); if [ "$max" -ge 65536 ]; then echo "$f  max_line=$max"; fi; done
+#发现两个物种
+conda activate agat
+for sample in \
+Ammopiptanthus_mongolicus_author \
+Astragalus_membranaceus_figshare
+do
+    fa="03_public_annotation/genome/${sample}.fasta"
+    wrap="03_public_annotation/genome/${sample}.wrap60.fasta"
+
+    echo "=== $sample ==="
+
+    seqkit seq -w 60 "$fa" > "$wrap"
+
+    echo -n "max line after wrap: "
+    awk '{if(length($0)>m)m=length($0)} END{print m}' "$wrap"
+
+    rm -f "03_public_annotation/protein_1gene1protein/${sample}.protein.fa"
+
+    agat_sp_extract_sequences.pl \
+      -g "03_public_annotation/gff_1gene1isoform/${sample}.gff" \
+      -f "$wrap" \
+      -t cds \
+      -p \
+      -o "03_public_annotation/protein_1gene1protein/${sample}.protein.fa"
+done
+#用标准过的蛋白跑busco
+conda activate busco6
+PRODIR="03_public_annotation/protein_1gene1protein"
+OUTDIR="03_public_annotation/busco_1gene1protein"
+LINEAGE="01_busco_db/lineages/fabales_odb12.2"
+mkdir -p "$OUTDIR/logs"
+
+for p in "$PRODIR"/*.protein.fa
+do
+    sample=$(basename "$p" .protein.fa)
+
+    echo "[BUSCO] $sample"
+
+    if ls "$OUTDIR/$sample"/short_summary*.txt >/dev/null 2>&1; then
+        echo "[SKIP] $sample"
+        continue
+    fi
+
+    busco \
+        -i "$p" \
+        -m proteins \
+        -l "$LINEAGE" \
+        --offline \
+        -o "$sample" \
+        --out_path "$OUTDIR" \
+        -c 25 \
+        > "$OUTDIR/logs/${sample}.log" 2>&1
+done
+#与helixer的对比，用物种名对应
+PRODIR="03_public_annotation/protein_1gene1protein"
+PUBBUSCO="03_public_annotation/busco_1gene1protein"
+HELBUSCO="04_busco_protein"
+OUT="03_public_annotation/public_1gene1protein_vs_helixer.tsv"
+echo -e "Public_sample\tSpecies\tHelixer_sample\tPublic_protein_n\tHelixer_C\tHelixer_S\tHelixer_D\tHelixer_F\tHelixer_M\tPublic_C\tPublic_S\tPublic_D\tPublic_F\tPublic_M\tDelta_C\tDelta_M\tDelta_D" > "$OUT"
+
+for p in "$PRODIR"/*.protein.fa
+do
+    pubsample=$(basename "$p" .protein.fa)
+    species=$(echo "$pubsample" | awk -F_ '{print $1"_"$2}')
+
+    pubsum=$(find "$PUBBUSCO/$pubsample" -name 'short_summary.specific*.txt' | head -1)
+
+    heldir=$(find "$HELBUSCO" -maxdepth 1 -mindepth 1 \
+      -type d -name "${species}_*" | head -1)
+
+    [ -z "$heldir" ] && {
+        echo "[NO HELIXER] $pubsample"
+        continue
+    }
+
+    helsample=$(basename "$heldir")
+    helsum=$(find "$heldir" -name 'short_summary.specific*.txt' | head -1)
+
+    [ -z "$pubsum" ] && {
+        echo "[NO PUBLIC BUSCO] $pubsample"
+        continue
+    }
+
+    [ -z "$helsum" ] && {
+        echo "[NO HELIXER BUSCO] $pubsample"
+        continue
+    }
+
+    get_busco () {
+        line=$(grep -m1 -E 'C:[0-9.]+%' "$1")
+
+        C=$(echo "$line" | sed -nE 's/.*C:([0-9.]+)%.*/\1/p')
+        S=$(echo "$line" | sed -nE 's/.*S:([0-9.]+)%.*/\1/p')
+        D=$(echo "$line" | sed -nE 's/.*D:([0-9.]+)%.*/\1/p')
+        F=$(echo "$line" | sed -nE 's/.*F:([0-9.]+)%.*/\1/p')
+        M=$(echo "$line" | sed -nE 's/.*M:([0-9.]+)%.*/\1/p')
+
+        echo "$C $S $D $F $M"
+    }
+
+    read HC HS HD HF HM <<< "$(get_busco "$helsum")"
+    read PC PS PD PF PM <<< "$(get_busco "$pubsum")"
+
+    pn=$(grep -c '^>' "$p")
+
+    DC=$(awk -v a="$PC" -v b="$HC" 'BEGIN{printf "%.1f",a-b}')
+    DM=$(awk -v a="$PM" -v b="$HM" 'BEGIN{printf "%.1f",a-b}')
+    DD=$(awk -v a="$PD" -v b="$HD" 'BEGIN{printf "%.1f",a-b}')
+
+    echo -e "$pubsample\t$species\t$helsample\t$pn\t$HC\t$HS\t$HD\t$HF\t$HM\t$PC\t$PS\t$PD\t$PF\t$PM\t$DC\t$DM\t$DD" >> "$OUT"
+done
+#从Delta_C的高到低排序查看
+{
+    head -1 "$OUT"
+    tail -n +2 "$OUT" | sort -t$'\t' -k15,15nr
+} | column -t | less -S
+#bucso_C多1%的就替换为public
+mkdir -p logs/agat
+mv agat_log_* logs/agat/
+ls logs/agat/ | wc -l
+ls | grep '^agat_log_'
+mkdir -p 05_annotation_qc
+mv 05_annotation_qc.tsv \
+   05_annotation_qc/helixer_annotation_qc.tsv
+cp 03_public_annotation/public_1gene1protein_vs_helixer.tsv \
+   05_annotation_qc/
+mkdir -p 06_orthofinder/input_final
+rm -f 06_orthofinder/input_final/*.fa
+#把质量差的5个排除，其余75个先复制进来
+HELDIR="03_proteomes/protein"
+OUTDIR="06_orthofinder/input_final"
+for p in "$HELDIR"/*.protein.fa
+do
+    base=$(basename "$p" .protein.fa)
+    species=$(echo "$base" | cut -d_ -f1-2)
+
+    case "$species" in
+        Hoita_strobilina|Eurypetalum_unijugum|Retama_dasycarpa|Vachellia_collinsii|Eperua_duckeana)
+            echo "[EXCLUDE] $species"
+            continue
+            ;;
+    esac
+
+    ln -s "$(readlink -f "$p")" "$OUTDIR/${species}.fa"
+done
+ls 06_orthofinder/input_final/*.fa | wc -l
+#用public的覆盖选中的14个
+PUBDIR="03_public_annotation/protein_1gene1protein"
+OUTDIR="06_orthofinder/input_final"
+cat > /tmp/use_public.txt <<'EOF'
+Astragalus_membranaceus
+Cajanus_cajan
+Chamaecrista_fasciculata
+Cicer_arietinum
+Lathyrus_oleraceus
+Lotus_japonicus
+Prosopis_cineraria
+Vicia_faba
+Vigna_radiata
+Gleditsia_sinensis
+Glycine_max
+Medicago_truncatula
+Pachyrhizus_erosus
+Phaseolus_vulgaris
+EOF
+
+while read species
+do
+    p=$(find "$PUBDIR" -maxdepth 1 \
+        -name "${species}_*.protein.fa" | head -1)
+
+    if [ -z "$p" ]; then
+        echo "[ERROR] Public protein not found: $species"
+        continue
+    fi
+
+    rm -f "$OUTDIR/${species}.fa"
+
+    ln -s "$(readlink -f "$p")" \
+        "$OUTDIR/${species}.fa"
+
+    echo "[PUBLIC] $species -> $(basename "$p")"
+
+done < /tmp/use_public.txt
+find 06_orthofinder/input_final \
+-type l -name '*.fa' | wc -l
+#来源记录表
+OUT="06_orthofinder/final_proteome_sources.tsv"
+echo -e "Species\tSource\tProtein_file" > "$OUT"
+for p in 06_orthofinder/input_final/*.fa
+do
+    species=$(basename "$p" .fa)
+    real=$(readlink -f "$p")
+
+    if echo "$real" | grep -q "protein_1gene1protein"; then
+        source="Public"
+    else
+        source="Helixer"
+    fi
+
+    echo -e "${species}\t${source}\t${real}" >> "$OUT"
+done
+#输入检查
+INDIR="06_orthofinder/input_final"
+
+echo "FASTA files:"
+find "$INDIR" -maxdepth 1 -name '*.fa' | wc -l
+
+echo "Empty files:"
+find -L "$INDIR" -maxdepth 1 -name '*.fa' -size 0 -print
+
+echo "Duplicate protein IDs:"
+for f in "$INDIR"/*.fa
+do
+    dup=$(seqkit seq -n -i "$f" | sort | uniq -d | head -1)
+    [ -n "$dup" ] && echo "$(basename "$f"): $dup"
+done
+#下载orthofinder
+mamba create -n orthofinder3 \
+  -c conda-forge -c bioconda \
+  python=3.12 orthofinder=3.2 -y
+conda install -c conda-forge brotli-python -y
+
+tmux new -s orthofinder75
+conda activate orthofinder3
+mkdir -p 06_orthofinder/logs
+orthofinder \
+  -f 06_orthofinder/input_final \
+  -t 32 \
+  -a 8 \
+  2>&1 | tee 06_orthofinder/logs/orthofinder_75.log
+#查看结果，可见有多少单拷贝基因，结果为0个
+RESULT=$(ls -dt \
+06_orthofinder/input_final/OrthoFinder/Results_* | head -1)
+cat "$RESULT/Comparative_Genomics_Statistics/Statistics_Overall.tsv"
+#查看orthofinder用了多少个og构建物种树，结果为108个
+find "$RESULT" \
+  -name 'Orthogroups_for_concatenated_alignment.txt' \
+  -exec wc -l {} \;
+#检查有这些og至少来自多少个物种
+grep -i "Species tree: Using" \
+06_orthofinder/logs/orthofinder_75.log
+
+RESULT=06_orthofinder/input_final/OrthoFinder/Results_Nov15
+seqkit stats \
+"$RESULT/WorkingDirectory/Alignments_ids/SpeciesTreeAlignment.fa"
+seqkit fx2tab -n -g \
+"$RESULT/WorkingDirectory/Alignments_ids/SpeciesTreeAlignment.fa" |
+sort -k2,2nr | head -20
+#检查gap率
+RESULT=06_orthofinder/input_final/OrthoFinder/Results_Nov15
+python3 - "$RESULT" <<'PY'
+import sys
+import re
+from pathlib import Path
+from collections import Counter
+
+base = Path(sys.argv[1])
+wd = base / "WorkingDirectory"
+
+names = {}
+
+with open(wd / "SpeciesIDs.txt") as f:
+    for line in f:
+        m = re.match(r"^\s*(\d+):\s*(.+?)\s*$", line)
+        if m:
+            sid, filename = m.groups()
+            name = Path(filename).name
+            name = re.sub(
+                r"\.(fa|faa|fasta|fas|pep|fna)(\.gz)?$",
+                "", name, flags=re.I
+            )
+            names[sid] = name
+
+seqs = {}
+current = None
+
+with open(wd / "Alignments_ids/SpeciesTreeAlignment.fa") as f:
+    for line in f:
+        line = line.strip()
+        if line.startswith(">"):
+            current = line[1:].split()[0]
+            seqs[current] = []
+        elif current is not None and line:
+            seqs[current].append(line)
+
+seqs = {k: "".join(v) for k, v in seqs.items()}
+
+lengths = set(map(len, seqs.values()))
+assert len(lengths) == 1, "比对序列长度不一致"
+
+L = lengths.pop()
+N = len(seqs)
+
+print("=== Gap最高的20个物种 ===")
+results = []
+
+for sid, seq in seqs.items():
+    gap = seq.count("-") / L * 100
+    results.append((sid, names.get(sid, sid), gap))
+
+for sid, name, gap in sorted(
+    results, key=lambda x: -x[2]
+)[:20]:
+    print(f"{sid}\t{name}\t{gap:.2f}%")
+
+print("\n=== 全矩阵位点覆盖度 ===")
+
+coverage = Counter()
+
+for column in zip(*seqs.values()):
+    present = sum(c not in "-?" for c in column)
+    coverage[present] += 1
+
+for threshold in [0.25, 0.50, 0.70, 0.90]:
+    required = threshold * N
+    sites = sum(
+        count for present, count in coverage.items()
+        if present >= required
+    )
+    print(
+        f">={threshold:.0%}物种有序列: "
+        f"{sites}/{L} ({sites/L*100:.2f}%)"
+    )
+
+print(f"\n总物种数: {N}")
+print(f"拼接长度: {L}")
+PY
+#检查108个建树OG的物种覆盖情况
+RESULT=06_orthofinder/input_final/OrthoFinder/Results_Nov15
+
+python3 - "$RESULT" <<'PY'
+import sys
+import re
+from pathlib import Path
+from collections import Counter
+from statistics import median
+
+base = Path(sys.argv[1])
+wd = base / "WorkingDirectory"
+
+og_list = base / "Species_Tree/Orthogroups_for_concatenated_alignment.txt"
+seq_dir = wd / "Sequences_ids"
+
+names = {}
+
+with open(wd / "SpeciesIDs.txt") as f:
+    for line in f:
+        m = re.match(r"^(\d+):\s*(\S+)", line.strip())
+        if m:
+            sid, filename = m.groups()
+            names[sid] = Path(filename).stem
+
+ogs = [
+    x.strip()
+    for x in og_list.read_text().splitlines()
+    if x.strip()
+]
+
+selected_single = Counter()
+selected_present = Counter()
+records = []
+
+for og in ogs:
+    f = seq_dir / f"{og}.fa"
+
+    if not f.exists():
+        raise FileNotFoundError(f"找不到OG序列文件: {f}")
+
+    counts = Counter()
+
+    with f.open() as handle:
+        for line in handle:
+            if line.startswith(">"):
+                gene_id = line[1:].split()[0]
+                m = re.match(r"^(\d+)_\d+$", gene_id)
+
+                if not m:
+                    raise ValueError(
+                        f"无法解析OrthoFinder内部基因ID: {gene_id}"
+                    )
+
+                sid = m.group(1)
+
+                if sid not in names:
+                    raise ValueError(f"未知物种编号: {sid}")
+
+                counts[sid] += 1
+
+    n_present = sum(v >= 1 for v in counts.values())
+    n_single = sum(v == 1 for v in counts.values())
+    n_multi = sum(v > 1 for v in counts.values())
+
+    records.append((og, n_present, n_single, n_multi))
+
+    for sid, count in counts.items():
+        selected_present[sid] += 1
+        if count == 1:
+            selected_single[sid] += 1
+
+print("=== 建树OG整体情况 ===")
+print("OG数量:", len(records))
+print("物种数量:", len(names))
+
+for label, index in [
+    ("至少存在1个拷贝的物种数", 1),
+    ("恰好单拷贝的物种数", 2)
+]:
+    values = [r[index] for r in records]
+
+    print(f"\n{label}:")
+    print("最少:", min(values))
+    print("中位数:", median(values))
+    print("最多:", max(values))
+
+print("\n=== 不同物种覆盖率的OG数量 ===")
+
+N = len(names)
+
+for pct in [0.25, 0.50, 0.70, 0.90]:
+    a = sum(r[1] / N >= pct for r in records)
+    b = sum(r[2] / N >= pct for r in records)
+
+    print(
+        f">={pct:.0%}: "
+        f"存在基因的OG={a}, "
+        f"单拷贝OG={b}"
+    )
+
+print("\n=== 每个物种在108个OG中的覆盖情况 ===")
+print("Species\tPresent_OGs\tSingle_Copy_OGs")
+
+rows = []
+
+for sid, name in names.items():
+    rows.append((
+        name,
+        selected_present[sid],
+        selected_single[sid]
+    ))
+
+for name, n_present, n_single in sorted(
+    rows, key=lambda x: x[2]
+):
+    print(f"{name}\t{n_present}\t{n_single}")
+
+print("\n=== 108个OG中单拷贝覆盖最高的前10个 ===")
+for og, present, single, multi in sorted(
+    records, key=lambda x: -x[2]
+)[:10]:
+    print(
+        f"{og}\tPresent={present}\t"
+        f"Single={single}\tMulti={multi}"
+    )
+PY
+#保存当前的concatenation（串联）树
+RESULT=06_orthofinder/input_final/OrthoFinder/Results_Nov15
+mkdir -p 06_orthofinder/tree_backup
+
+cp "$RESULT/Species_Tree/SpeciesTree_rooted.txt" \
+   06_orthofinder/tree_backup/SpeciesTree_concat_rooted.txt
+
+cp "$RESULT/Species_Tree/SpeciesTree_rooted_node_labels.txt" \
+   06_orthofinder/tree_backup/SpeciesTree_concat_rooted_node_labels.txt
+#确认ASTRAL-Pro可用
+orthofinder --help | grep -A2 '\-ST'
+#从已有的gene_tree重启
+orthofinder \
+  -fgt "$RESULT" \
+  -ST astral-pro \
+  -t 32 \
+  -a 8 \
+  2>&1 | tee 06_orthofinder/logs/orthofinder_75_astralpro.log
+#此树为旧的树，需重新生成
+cat "$RESULT/Species_Tree/SpeciesTree_rooted.txt"
+grep -i -E 'astral|species tree' \
+06_orthofinder/logs/orthofinder_75_astralpro.log | tail -30
+md5sum \
+06_orthofinder/tree_backup/SpeciesTree_concat_rooted.txt \
+"$RESULT/Species_Tree/SpeciesTree_rooted.txt"
+#手动生成ASTRAL-Pro的输入
+mkdir -p 06_orthofinder/astral_pro
+
+python3 - "$WD" <<'PY'
+import sys
+import re
+from pathlib import Path
+
+wd = Path(sys.argv[1])
+
+# species ID -> species name
+species = {}
+
+with open(wd / "SpeciesIDs.txt") as f:
+    for line in f:
+        m = re.match(r"^\s*(\d+):\s*(.+?)\s*$", line)
+        if not m:
+            continue
+
+        sid, filename = m.groups()
+        name = Path(filename).name
+        name = re.sub(
+            r"\.(fa|faa|fasta|fas|pep|fna)(\.gz)?$",
+            "",
+            name,
+            flags=re.I
+        )
+
+        species[sid] = name
+
+tree_dir = wd / "Trees_ids"
+trees = sorted(tree_dir.glob("OG*.txt"))
+
+if not trees:
+    raise SystemExit("ERROR: Trees_ids 中没有找到 OG*.txt")
+
+out_tree = Path("06_orthofinder/astral_pro/gene_trees.nwk")
+out_map  = Path("06_orthofinder/astral_pro/gene_to_species.tsv")
+
+seen_genes = set()
+n_tree = 0
+
+with open(out_tree, "w") as fout, open(out_map, "w") as fmap:
+
+    for fn in trees:
+        text = fn.read_text().strip()
+
+        if not text:
+            continue
+
+        fout.write(text + "\n")
+        n_tree += 1
+
+        # OrthoFinder internal gene IDs，例如 12_3456
+        genes = re.findall(r"(?<=[(,])([0-9]+_[0-9]+)(?=[:),])", text)
+
+        for gene in genes:
+            if gene in seen_genes:
+                continue
+
+            sid = gene.split("_", 1)[0]
+
+            if sid not in species:
+                raise SystemExit(
+                    f"ERROR: gene {gene} 找不到 species ID {sid}"
+                )
+
+            fmap.write(f"{gene}\t{species[sid]}\n")
+            seen_genes.add(gene)
+
+print("Gene trees:", n_tree)
+print("Unique gene tips:", len(seen_genes))
+print("Species:", len(species))
+PY
+#检查数量，基因物种对应表
+wc -l 06_orthofinder/astral_pro/gene_trees.nwk 06_orthofinder/astral_pro/gene_to_species.tsv
+cut -f2 06_orthofinder/astral_pro/gene_to_species.tsv | sort -u | wc -l
+#ASTRAL建树
+astral-pro3 \
+  -a 06_orthofinder/astral_pro/gene_to_species.tsv \
+  -o 06_orthofinder/astral_pro/SpeciesTree_astralpro_unrooted.nwk \
+  06_orthofinder/astral_pro/gene_trees.nwk \
+  2> 06_orthofinder/astral_pro/astralpro.log
+#查看结果
+cat 06_orthofinder/astral_pro/SpeciesTree_astralpro_unrooted.nwk
+tail -30 \
+06_orthofinder/astral_pro/astralpro.log
+#物种树所用的物种
+grep -oE '[A-Z][A-Za-z]+_[a-z][A-Za-z_]+' \
+06_orthofinder/astral_pro/SpeciesTree_astralpro_unrooted.nwk |
+sort -u |
+wc -l
+#把astraal和单基因的物种树保存至其他地方，防止结果被覆盖
+mkdir -p 06_orthofinder/final_tree
+cp \
+06_orthofinder/astral_pro/SpeciesTree_astralpro_unrooted.nwk \
+06_orthofinder/final_tree/75species_ASTRALPro_unrooted.nwk
+cp \
+06_orthofinder/astral_pro/astralpro.log \
+06_orthofinder/final_tree/
+cp \
+06_orthofinder/tree_backup/SpeciesTree_concat_rooted.txt \
+06_orthofinder/final_tree/75species_OrthoFinder_concat_rooted.nwk
+#将结果放到itol网站上做可视化，将五亚科颜色注释文件legume75_itol_subfamily_colorstrip.txt导入进去标注亚科颜色
+#将亚科对应表legume75_subfamily_mapping.tsv放到06_orthofinder/final_tree/文件夹里
+#检查该亚科是否对应无根树中的一个完整分支
+TREE="06_orthofinder/astral_pro/SpeciesTree_astralpro_unrooted.nwk"
+MAP="06_orthofinder/final_tree/legume75_subfamily_mapping.tsv"
+
+python3 - "$TREE" "$MAP" <<'PY'
+import sys
+import csv
+from collections import defaultdict
+from Bio import Phylo
+
+treefile, mapfile = sys.argv[1:3]
+
+groups = defaultdict(set)
+
+with open(mapfile) as f:
+    for row in csv.DictReader(f, delimiter="\t"):
+        groups[row["Subfamily"]].add(row["Species"])
+
+original = Phylo.read(treefile, "newick")
+all_species = {x.name for x in original.get_terminals()}
+mapped_species = set().union(*groups.values())
+
+if all_species != mapped_species:
+    print("树和注释表物种不一致")
+    print("树中未注释:", sorted(all_species - mapped_species))
+    print("注释表多出:", sorted(mapped_species - all_species))
+    sys.exit(1)
+
+print("物种总数:", len(all_species))
+print("\n=== 亚科单系性检验 ===")
+
+for subfamily, members in sorted(groups.items()):
+
+    if len(members) < 2:
+        print(f"{subfamily}: 只有1个物种，无法检验")
+        continue
+
+    # 每次重新读取原始无根树
+    tree = Phylo.read(treefile, "newick")
+
+    # 选择一个该亚科以外的物种临时定根
+    outside = sorted(all_species - members)[0]
+    tree.root_with_outgroup(outside)
+
+    ancestor = tree.common_ancestor(*sorted(members))
+    descendants = {
+        x.name for x in ancestor.get_terminals()
+    }
+
+    extra = descendants - members
+
+    if not extra:
+        print(f"{subfamily}: PASS ({len(members)} species)")
+    else:
+        print(f"{subfamily}: FAIL ({len(members)} species)")
+        print("  混入的其他物种:", ", ".join(sorted(extra)))
+PY
+#检查一些物种是否是姐妹群
+python3 - <<'PY'
+from Bio import Phylo
+
+f = "06_orthofinder/astral_pro/SpeciesTree_astralpro_unrooted.nwk"
+
+tests = {
+    "Arachis-Stylosanthes": [
+        "Arachis_hypogaea",
+        "Stylosanthes_angustifolia"
+    ],
+    "Vigna-Phaseolus": [
+        "Vigna_radiata",
+        "Phaseolus_vulgaris"
+    ],
+    "Medicago-Trigonella": [
+        "Medicago_truncatula",
+        "Trigonella_corniculata"
+    ],
+    "Vicia-Lathyrus": [
+        "Vicia_faba",
+        "Lathyrus_oleraceus"
+    ],
+    "Astragalus-Oxytropis": [
+        "Astragalus_membranaceus",
+        "Oxytropis_ochrocephala"
+    ],
+    "Genista-Ulex": [
+        "Genista_pilosa",
+        "Ulex_minor"
+    ]
+}
+
+for label, species in tests.items():
+    tree = Phylo.read(f, "newick")
+    all_names = {x.name for x in tree.get_terminals()}
+    members = set(species)
+
+    outside = sorted(all_names - members)[0]
+    tree.root_with_outgroup(outside)
+
+    node = tree.common_ancestor(*species)
+    descendants = {x.name for x in node.get_terminals()}
+
+    result = "PASS" if descendants == members else "FAIL"
+    print(f"{label}: {result}")
+PY
+#节点支持度，检查结果显示其72个内部枝LPP都大于0.95
+python3 - <<'PY'
+from Bio import Phylo
+
+f = "06_orthofinder/astral_pro/SpeciesTree_astralpro_unrooted.nwk"
+
+tree = Phylo.read(f, "newick")
+
+nodes = [
+    clade for clade in tree.find_clades()
+    if clade.clades and clade.confidence is not None
+]
+
+values = [float(x.confidence) for x in nodes]
+
+print("有支持度的内部节点:", len(values))
+print("LPP >= 0.95:", sum(x >= 0.95 for x in values))
+print("0.90 <= LPP < 0.95:",
+      sum(0.90 <= x < 0.95 for x in values))
+print("LPP < 0.90:", sum(x < 0.90 for x in values))
+
+print("\n=== 支持度最低的10个节点 ===")
+
+all_names = {x.name for x in tree.get_terminals()}
+
+for node in sorted(nodes, key=lambda x: x.confidence)[:10]:
+    desc = {x.name for x in node.get_terminals()}
+    other = all_names - desc
+    smaller = desc if len(desc) <= len(other) else other
+
+    print(f"\nLPP = {node.confidence:.6f}")
+    print("较小侧物种数:", len(smaller))
+    print("代表物种:", ", ".join(sorted(smaller)[:8]))
+PY
+#检查局部quartet支持情况
+DIR="06_orthofinder/astral_pro"
+astral-pro3 \
+  -C \
+  -u 2 \
+  -t 16 \
+  -a "$DIR/gene_to_species.tsv" \
+  -c "$DIR/SpeciesTree_astralpro_unrooted.nwk" \
+  -o "$DIR/SpeciesTree_quartet_annotated.nwk" \
+  "$DIR/gene_trees.nwk" \
+  2> "$DIR/quartet_annotation.log"
+#查看结果
+ls -lh "$DIR/SpeciesTree_quartet_annotated.nwk"
+head -c 1200 "$DIR/SpeciesTree_quartet_annotated.nwk"
+tail -10 "$DIR/quartet_annotation.log"
+#
+python3 - <<'PY'
+from Bio import Phylo
+from statistics import median
+from pathlib import Path
+import csv
+
+f = Path("06_orthofinder/astral_pro/SpeciesTree_quartet_annotated.nwk")
+tree = Phylo.read(f, "newick")
+
+all_species = {x.name for x in tree.get_terminals()}
+rows = []
+
+for node in tree.get_nonterminals():
+    label = (node.name or "").strip("[]'")
+
+    data = {}
+    for item in label.split(";"):
+        if "=" in item:
+            k, v = item.split("=", 1)
+            data[k] = v
+
+    if not all(k in data for k in ["q1", "q2", "q3", "localPP"]):
+        continue
+
+    descendants = {x.name for x in node.get_terminals()}
+    outside = all_species - descendants
+    side = min([descendants, outside], key=len)
+
+    rows.append({
+        "LPP": float(data["localPP"]),
+        "q1": float(data["q1"]),
+        "q2": float(data["q2"]),
+        "q3": float(data["q3"]),
+        "Side_n": len(side),
+        "Side_species": ",".join(sorted(side))
+    })
+
+values = [r["q1"] for r in rows]
+
+print("=== Quartet统计 ===")
+print("有注释的内部枝:", len(rows))
+print("q1最小值:", round(min(values), 4))
+print("q1中位数:", round(median(values), 4))
+print("q1最大值:", round(max(values), 4))
+
+for low, high in [(0, 0.5), (0.5, 0.7),
+                  (0.7, 0.9), (0.9, 1.01)]:
+    n = sum(low <= x < high for x in values)
+    print(f"{low:.1f} <= q1 < {high:.2f}: {n}")
+
+print("\n=== q1最低的15个节点 ===")
+for r in sorted(rows, key=lambda x: x["q1"])[:15]:
+    print(
+        f"q1={r['q1']:.4f} "
+        f"q2={r['q2']:.4f} "
+        f"q3={r['q3']:.4f} "
+        f"n={r['Side_n']} "
+        f"{','.join(r['Side_species'].split(',')[:5])}"
+    )
+
+out = f.parent / "quartet_support_summary.tsv"
+with open(out, "w") as fh:
+    writer = csv.DictWriter(
+        fh, fieldnames=rows[0].keys(), delimiter="\t"
+    )
+    writer.writeheader()
+    writer.writerows(sorted(rows, key=lambda x: x["q1"]))
+
+print("\n输出文件:", out)
+PY
+#检查该基因树包含多少个物种，每个物种参与多少基因树
+RESULT=06_orthofinder/input_final/OrthoFinder/Results_Nov15
+
+python3 - "$RESULT" <<'PY'
+import sys
+import re
+from pathlib import Path
+from collections import Counter
+from statistics import median
+
+base = Path(sys.argv[1])
+wd = base / "WorkingDirectory"
+
+names = {}
+for line in (wd / "SpeciesIDs.txt").read_text().splitlines():
+    m = re.match(r"^(\d+):\s*(\S+)", line.strip())
+    if m:
+        names[m.group(1)] = Path(m.group(2)).stem
+
+treefile = Path("06_orthofinder/astral_pro/gene_trees.nwk")
+
+coverage = Counter()
+tree_sizes = []
+
+with open(treefile) as f:
+    for line in f:
+        ids = set(re.findall(
+            r"(?<=[(,])(\d+)_\d+(?=[:),])",
+            line
+        ))
+
+        tree_sizes.append(len(ids))
+
+        for sid in ids:
+            coverage[sid] += 1
+
+print("=== Gene tree 物种覆盖统计 ===")
+print("总树数:", len(tree_sizes))
+print("最少物种数:", min(tree_sizes))
+print("中位数:", median(tree_sizes))
+print("最多物种数:", max(tree_sizes))
+
+for n in [4, 10, 20, 40, 60, 70]:
+    count = sum(x >= n for x in tree_sizes)
+    print(f"覆盖>={n}物种: {count}")
+
+print("\n=== 每个物种参与的gene tree数量 ===")
+
+for sid, num in sorted(
+    coverage.items(), key=lambda x: x[1]
+)[:15]:
+    print(names[sid], num)
+
+print("\n完全没有进入基因树的物种:")
+print([names[s] for s in names if coverage[s] == 0])
+PY
+
