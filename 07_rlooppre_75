@@ -1,3 +1,1689 @@
 
 cd /data/mshe/deepRloopPro_data/
 mkdir rlooppre_75
+#将75个物种基因组路径表‘selected_75_genomes.tsv’上传到以上文件夹
+#统计CM/CHR/NC/LG命名的染色体有多少
+vim prepare_primary_chromsizes_75.py
+#!/usr/bin/env python3
+"""Review and prepare main-chromosome chromsize files for the fixed 75 legume assemblies.
+
+Run on the user's Linux server with the original FASTA and FAI files:
+  python3 /data/mshe/deepRloopPro_data/rlooppre_75/prepare_primary_chromsizes_75.py --inspect
+  # After review/approval:
+  python3 /data/mshe/deepRloopPro_data/rlooppre_75/prepare_primary_chromsizes_75.py --finalize
+
+The script NEVER silently substitutes all scaffolds for main chromosomes.
+An APPROVE_CANDIDATE decision requires manual inspection first. For an
+assembly lacking named chromosomes, USE_ID_FILE (curated IDs) or an explicit
+SCAFFOLD_ALL decision can be used, and the output marks those cases clearly.
+"""
+
+import argparse
+import csv
+import re
+import shutil
+import subprocess
+import sys
+from collections import Counter
+from pathlib import Path
+
+WORKDIR = Path('/data/mshe/deepRloopPro_data/rlooppre_75')
+SELECTION = WORKDIR / 'selected_75_genomes.tsv'
+CANDIDATE_DIR = WORKDIR / 'candidate_chromsizes'
+PRIMARY_DIR = WORKDIR / 'chromsizes_primary'
+OVERRIDE_DIR = WORKDIR / 'manual_seqids'
+REPORT = WORKDIR / 'chromosome_candidates_75.tsv'
+DETAILS = WORKDIR / 'chromosome_candidate_ids_75.tsv'
+DECISIONS = WORKDIR / 'chromosome_decisions_75.tsv'
+FINAL_RUNLIST = WORKDIR / 'run_list_75_primary.tsv'
+FINAL_INFO = WORKDIR / 'genome_info_75_primary.tsv'
+
+CHROM_RE = re.compile(r'^(?:chr(?:omosome)?[-_.]?)(?:\d{1,3}[ABD]?|[IVXLCDM]{1,5}|[XYZW])$', re.I)
+CM_RE = re.compile(r'^CM\d+(?:\.\d+)?$', re.I)
+NC_RE = re.compile(r'^NC_\d+(?:\.\d+)?$', re.I)
+LG_RE = re.compile(r'^LG[-_.]?\d{1,3}[ABD]?$', re.I)
+ORGANELLE_RE = re.compile(r'(chloroplast|plastid|mitochondr|mitogenome|chromosome\s*[MC]\b)', re.I)
+NON_PRIMARY_RE = re.compile(r'(unlocalized|unplaced|alternate locus|alternate haplotype|alt[_ -]locus|_random\b|\bscaffold\b|\bcontig\b|\bpatch\b)', re.I)
+RULE_ORDER = ('CM', 'CHR', 'NC', 'LG')
+REVIEW_COLS = ['PREFIX', 'ASSEMBLY_OR_SOURCE', 'RULE', 'FASTA_SEQS', 'FASTA_BP',
+               'CANDIDATE_SEQS', 'CANDIDATE_BP', 'CANDIDATE_PCT',
+               'CANDIDATE_IDS_EXAMPLE', 'OTHER_IDS_EXAMPLE', 'COMMENT']
+
+
+def write_tsv(path, fieldnames, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + '.tmp')
+    with temp.open('w', encoding='utf-8', newline='') as fp:
+        w = csv.DictWriter(fp, fieldnames=fieldnames, delimiter='\t', lineterminator='\n')
+        w.writeheader()
+        w.writerows(rows)
+    temp.replace(path)
+
+
+def load_selection():
+    with SELECTION.open(encoding='utf-8', newline='') as fp:
+        reader = csv.DictReader(fp, delimiter='\t')
+        required = ('PREFIX', 'ASSEMBLY_OR_SOURCE', 'SOURCE_DIR', 'FASTA_FILENAME')
+        if not reader.fieldnames or not all(x in reader.fieldnames for x in required):
+            raise ValueError('Invalid selected_75_genomes.tsv header')
+        rows = list(reader)
+    counts = Counter(r['PREFIX'] for r in rows)
+    if len(rows) != 75 or len(counts) != 75:
+        raise ValueError(f'Expected 75 unique species, got {len(rows)} rows and {len(counts)} species')
+    for r in rows:
+        src = Path(r['SOURCE_DIR'])
+        if not src.is_absolute() or Path(r['FASTA_FILENAME']).name != r['FASTA_FILENAME']:
+            raise ValueError(f'Invalid source path for {r["PREFIX"]}')
+    return rows
+
+
+def read_fai(fasta):
+    fai = Path(str(fasta) + '.fai')
+    if not fai.is_file() or fai.stat().st_size == 0 or fai.stat().st_mtime < fasta.stat().st_mtime:
+        if not shutil.which('samtools'):
+            raise RuntimeError(f'No fresh .fai for {fasta}; samtools is unavailable')
+        print(f'[INDEX] {fasta.name}', flush=True)
+        subprocess.run(['samtools', 'faidx', str(fasta)], check=True)
+    rows = []
+    seen = set()
+    with fai.open(encoding='utf-8') as fp:
+        for n, raw in enumerate(fp, 1):
+            f = raw.rstrip('\n\r').split('\t')
+            if len(f) < 3:
+                raise ValueError(f'FAI invalid at {fai}:{n} (need >=3 columns)')
+            name, bp, offset = f[0], int(f[1]), int(f[2])
+            if not name or name in seen or bp <= 0 or offset < 0:
+                raise ValueError(f'Duplicate/invalid FAI record {fai}:{n}: {name}')
+            seen.add(name)
+            rows.append((name, bp, offset))
+    if not rows:
+        raise ValueError(f'FAI empty: {fai}')
+    return rows
+
+
+def header_at(fasta_handle, offset):
+    """Retrieve only the FASTA header immediately before the sequence offset.
+
+    No full FASTA scan; a small seek/read per chromosome-like candidate.
+    """
+    window = min(offset, 65536)
+    fasta_handle.seek(offset - window)
+    before = fasta_handle.read(window).rstrip(b'\r\n')
+    header = before.rsplit(b'\n', 1)[-1].decode('utf-8', errors='replace').lstrip('\r')
+    return header if header.startswith('>') else ''
+
+
+def name_rule(name):
+    if CM_RE.fullmatch(name):
+        return 'CM'
+    if CHROM_RE.fullmatch(name):
+        return 'CHR'
+    if NC_RE.fullmatch(name):
+        return 'NC'
+    if LG_RE.fullmatch(name):
+        return 'LG'
+    return ''
+
+
+def inspect_one(row):
+    fasta = Path(row['SOURCE_DIR']) / row['FASTA_FILENAME']
+    if not fasta.is_file() or fasta.stat().st_size == 0:
+        raise FileNotFoundError(f'FASTA absent/empty: {fasta}')
+    seqs = read_fai(fasta)
+    rule_lists = {x: [] for x in RULE_ORDER}
+    skipped = []
+    with fasta.open('rb') as fp:
+        for name, size, offset in seqs:
+            rule = name_rule(name)
+            if not rule:
+                continue
+            header = header_at(fp, offset)
+            # If header is unavailable, report it; do not auto-approve.
+            if ORGANELLE_RE.search(name) or ORGANELLE_RE.search(header):
+                skipped.append((name, 'organellar_name_or_header'))
+                continue
+            if NON_PRIMARY_RE.search(header) or NON_PRIMARY_RE.search(name):
+                skipped.append((name, 'non_primary_header'))
+                continue
+            rule_lists[rule].append((name, size, header))
+
+    active = next((rule for rule in RULE_ORDER if rule_lists[rule]), 'NONE')
+    chosen = rule_lists[active] if active != 'NONE' else []
+    chosen_names = {x[0] for x in chosen}
+    other = [(n, bp) for n, bp, _ in seqs if n not in chosen_names]
+    total_bp = sum(bp for _, bp, _ in seqs)
+    selected_bp = sum(bp for _, bp, _ in chosen)
+    alternatives = [x for x in RULE_ORDER if x != active and rule_lists[x]]
+    comments = []
+    if active == 'NONE':
+        comments.append('NO_RECOGNIZABLE_CHROMOSOME_NAMES')
+    if alternatives:
+        comments.append('OTHER_CHROMOSOME_LIKE_IDS=' + ','.join(alternatives))
+    if active == 'NC':
+        comments.append('NC_ACCESSIONS_REQUIRE_NUCLEAR_CHROMOSOME_VERIFICATION')
+    if active == 'LG':
+        comments.append('LINKAGE_GROUPS_REQUIRE_ASSEMBLY_VERIFICATION')
+    if len(chosen) == 1:
+        comments.append('SINGLE_CANDIDATE_REVIEW')
+    if chosen and selected_bp / total_bp < 0.60:
+        comments.append('LOW_CHROMOSOME_BASE_FRACTION_REVIEW')
+    if skipped:
+        comments.append(f'EXCLUDED_HEADER_FLAGS={len(skipped)}')
+    if any(not hdr for _, _, hdr in chosen):
+        comments.append('HEADER_NOT_READ_FOR_SOME_CANDIDATES')
+    summary = {
+        'PREFIX': row['PREFIX'],
+        'ASSEMBLY_OR_SOURCE': row['ASSEMBLY_OR_SOURCE'],
+        'RULE': active,
+        'FASTA_SEQS': len(seqs),
+        'FASTA_BP': total_bp,
+        'CANDIDATE_SEQS': len(chosen),
+        'CANDIDATE_BP': selected_bp,
+        'CANDIDATE_PCT': f'{100 * selected_bp / total_bp:.2f}',
+        'CANDIDATE_IDS_EXAMPLE': ','.join(x[0] for x in chosen[:8]) or '-',
+        'OTHER_IDS_EXAMPLE': ','.join(x[0] for x in sorted(other, key=lambda x: x[1], reverse=True)[:5]) or '-',
+        'COMMENT': ';'.join(comments) or 'REVIEW_WITH_ASSEMBLY_INFORMATION',
+    }
+    return fasta, seqs, chosen, active, summary
+
+
+def inspect_all(selected):
+    CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
+    summary_rows, detail_rows, result = [], [], {}
+    for i, row in enumerate(selected, 1):
+        fasta, seqs, chosen, rule, summary = inspect_one(row)
+        name = row['PREFIX']
+        print(f'[{i:02d}/75] {name}: {rule}, {len(chosen)} candidates, '
+              f'{summary["CANDIDATE_PCT"]}% of assembly', flush=True)
+        preview = CANDIDATE_DIR / (name + '.candidate.chrom.sizes')
+        if chosen:
+            preview.write_text(''.join(f'{sid}\t{bp}\n' for sid, bp, _ in chosen), encoding='utf-8')
+        elif preview.exists():
+            preview.unlink()
+        summary_rows.append(summary)
+        for sid, bp, header in chosen:
+            detail_rows.append({'PREFIX': name, 'RULE': rule, 'SEQ_ID': sid,
+                                'LENGTH_BP': bp, 'FASTA_HEADER': header})
+        result[name] = (fasta, seqs, chosen, rule)
+
+    write_tsv(REPORT, REVIEW_COLS, summary_rows)
+    write_tsv(DETAILS, ['PREFIX', 'RULE', 'SEQ_ID', 'LENGTH_BP', 'FASTA_HEADER'], detail_rows)
+    if not DECISIONS.exists():
+        write_tsv(DECISIONS, ['PREFIX', 'ACTION', 'NOTE'],
+                  [{'PREFIX': row['PREFIX'], 'ACTION': '', 'NOTE': ''} for row in selected])
+        print(f'[CREATED] Decision template: {DECISIONS}')
+    else:
+        print(f'[KEEP] Existing decision file unchanged: {DECISIONS}')
+
+    modes = Counter(r['RULE'] for r in summary_rows)
+    print('[SUMMARY] ' + '  '.join(f'{rule}={modes[rule]}' for rule in [*RULE_ORDER, 'NONE']))
+    print(f'[REPORT] {REPORT}')
+    print(f'[DETAILS] {DETAILS}')
+    print('[NOTE] Candidate chrom.sizes are NOT final prediction inputs.')
+    return result
+
+
+def load_decisions(selected):
+    with DECISIONS.open(encoding='utf-8', newline='') as fp:
+        reader = csv.DictReader(fp, delimiter='\t')
+        if not reader.fieldnames or 'PREFIX' not in reader.fieldnames or 'ACTION' not in reader.fieldnames:
+            raise ValueError('chromosome_decisions_75.tsv needs PREFIX and ACTION columns')
+        rows = list(reader)
+    choices = {}
+    for row in rows:
+        sp = row['PREFIX'].strip()
+        if sp in choices:
+            raise ValueError(f'Duplicate decision: {sp}')
+        choices[sp] = row['ACTION'].strip().upper()
+    missing = [r['PREFIX'] for r in selected if r['PREFIX'] not in choices or not choices[r['PREFIX']]]
+    unknown = sorted(set(choices) - {r['PREFIX'] for r in selected})
+    if missing or unknown or len(rows) != 75:
+        raise ValueError('All 75 decisions required before --finalize. '
+                         f'Missing/blank={len(missing)} (first: {missing[:10]}), unknown={unknown}')
+    legal = {'APPROVE_CANDIDATE', 'USE_ID_FILE', 'SCAFFOLD_ALL'}
+    invalid = {k: v for k, v in choices.items() if v not in legal}
+    if invalid:
+        raise ValueError(f'Invalid ACTION entries: {invalid}')
+    return choices
+
+
+def curated_ids(prefix):
+    path = OVERRIDE_DIR / (prefix + '.txt')
+    if not path.is_file():
+        raise FileNotFoundError(f'USE_ID_FILE requires {path}')
+    result = []
+    with path.open(encoding='utf-8') as fp:
+        for line in fp:
+            item = line.strip()
+            if item and not item.startswith('#'):
+                result.append(item)
+    if not result or len(result) != len(set(result)):
+        raise ValueError(f'Empty or duplicate IDs in {path}')
+    return result
+
+
+def finalize(selected, results):
+    choices = load_decisions(selected)
+    to_write = []
+    info_rows = []
+    for row in selected:
+        sp = row['PREFIX']
+        fasta, seqs, candidate, rule = results[sp]
+        action = choices[sp]
+        candidates = {name for name, _, _ in candidate}
+        all_names = {name for name, _, _ in seqs}
+        if action == 'APPROVE_CANDIDATE':
+            if not candidates:
+                raise ValueError(f'{sp}: no candidates to approve; choose USE_ID_FILE or SCAFFOLD_ALL')
+            selected_ids = candidates
+            mode = 'reviewed_' + rule
+        elif action == 'USE_ID_FILE':
+            selected_ids = set(curated_ids(sp))
+            absent = selected_ids - all_names
+            if absent:
+                raise ValueError(f'{sp}: IDs missing in FASTA: {sorted(absent)[:10]}')
+            mode = 'manual_ID_file'
+        else:
+            selected_ids = all_names
+            mode = 'SCAFFOLD_ALL_explicit'
+        selected_rows = [(sid, bp) for sid, bp, _ in seqs if sid in selected_ids]
+        if not selected_rows:
+            raise ValueError(f'{sp}: selected zero sequence IDs')
+        all_bp = sum(bp for _, bp, _ in seqs)
+        selected_bp = sum(bp for _, bp in selected_rows)
+        chrom = PRIMARY_DIR / f'{sp}.chrom.sizes'
+        to_write.append((sp, fasta, chrom, selected_rows))
+        info_rows.append({'PREFIX': sp, 'ASSEMBLY_OR_SOURCE': row['ASSEMBLY_OR_SOURCE'],
+                          'MODE': mode, 'FASTA_SEQS': len(seqs), 'FASTA_BP': all_bp,
+                          'SELECTED_SEQS': len(selected_rows), 'SELECTED_BP': selected_bp,
+                          'SELECTED_PCT': f'{selected_bp / all_bp * 100:.2f}',
+                          'FASTA': str(fasta), 'CHROMSIZE': str(chrom)})
+
+    PRIMARY_DIR.mkdir(parents=True, exist_ok=True)
+    for _, _, path, pairs in to_write:
+        path.write_text(''.join(f'{sid}\t{bp}\n' for sid, bp in pairs), encoding='utf-8')
+    runlist_temp = FINAL_RUNLIST.with_suffix('.tsv.tmp')
+    runlist_temp.write_text(''.join(f'{sp}\t{fasta}\t{chrom}\n'
+                                    for sp, fasta, chrom, _ in to_write), encoding='utf-8')
+    runlist_temp.replace(FINAL_RUNLIST)
+    write_tsv(FINAL_INFO, ['PREFIX', 'ASSEMBLY_OR_SOURCE', 'MODE', 'FASTA_SEQS', 'FASTA_BP',
+                           'SELECTED_SEQS', 'SELECTED_BP', 'SELECTED_PCT', 'FASTA', 'CHROMSIZE'],
+              info_rows)
+    print(f'[DONE] Final prediction runlist: {FINAL_RUNLIST} (75 rows, no header)')
+    print(f'[DONE] Selected-sequence statistics: {FINAL_INFO}')
+    print('[MODE BREAKDOWN]', dict(Counter(x['MODE'] for x in info_rows)))
+    print('[CAUTION] SCAFFOLD_ALL cases are full-assembly fallbacks, NOT main-chromosome predictions.')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    stage = parser.add_mutually_exclusive_group(required=True)
+    stage.add_argument('--inspect', action='store_true', help='Inspect and create draft candidates and summary')
+    stage.add_argument('--finalize', action='store_true', help='After approval, generate final chrom.sizes/runlist')
+    args = parser.parse_args()
+    selected = load_selection()
+    results = inspect_all(selected)
+    if args.finalize:
+        finalize(selected, results)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+        print(f'[ERROR] {exc}', file=sys.stderr)
+        sys.exit(1)
+#运行inspect模式
+python3 prepare_primary_chromsizes_75.py --inspect
+#有28个物种的染色体命名不是以上那些，放宽要求重新检查第二遍，找到xxx.Chr01或者header里面有写chromosome的序列
+vim audit_primary_sequences_75.py
+#!/usr/bin/env python3
+"""Second-pass audit of chromosome IDs in the fixed 75 legume assemblies.
+
+Run on the user's server:
+  cd /data/mshe/deepRloopPro_data/rlooppre_75
+  python3 audit_primary_sequences_75.py
+
+Reads selected_75_genomes.tsv and chromosome_candidates_75.tsv, and inspects
+FAI indices and a *small part* of FASTA files (only deflines as needed).
+Reports possible chromosomes, including namespaced IDs such as Gsin.Chr01.
+Does NOT modify chromosome_decisions_75.tsv or final prediction inputs.
+"""
+import argparse
+import csv
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+DEFAULT_WORKDIR = Path('/data/mshe/deepRloopPro_data/rlooppre_75')
+EMBEDDED_CHR = re.compile(r'(?:^|[.\-_])chr(?:omosome)?[-_.]?(?:0*[1-9]\d*(?:[a-d])?|[xyzw])$', re.I)
+GENERIC_CHR = re.compile(r'\bchromosome\s*(?:[:=_\-]\s*)?(?:\d+[a-d]?|[xyzw]|[ivx]+|[1-9][ls])\b', re.I)
+ORGANELLE = re.compile(r'chloroplast|plastid|mitochond|mitogenom|organellar|\bchr[mc]\b|chromosome\s*[:=_ -]?\s*[mc]\b', re.I)
+NONPRIMARY = re.compile(r'\bunlocalized\b|\bunplaced\b|\bscaffold\b|\bcontig\b|\bpatch\b|alternate locus|alternate haplotype|\brandom\b', re.I)
+ACCESSION = re.compile(r'^(?:CP|OX|OY|OZ)\d+(?:\.\d+)?$', re.I)
+
+
+def load_tsv(path):
+    with path.open(encoding='utf-8', newline='') as f:
+        return list(csv.DictReader(f, delimiter='\t'))
+
+
+def write_tsv(path, keys, rows):
+    tmp = path.with_suffix('.tmp')
+    with tmp.open('w', encoding='utf-8', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=keys, delimiter='\t', lineterminator='\n')
+        w.writeheader()
+        w.writerows(rows)
+    tmp.replace(path)
+
+
+def read_fai(path):
+    fai_path = Path(str(path) + '.fai')
+    if not fai_path.is_file():
+        raise FileNotFoundError(f'Missing FAI: {fai_path} (run --inspect first)')
+    seqs = []
+    with fai_path.open(encoding='utf-8') as f:
+        for line in f:
+            p = line.rstrip('\r\n').split('\t')
+            if len(p) < 3:
+                raise ValueError(f'Invalid FAI line: {fai_path}')
+            seqs.append((p[0], int(p[1]), int(p[2])))
+    if not seqs:
+        raise ValueError(f'Empty FAI: {fai_path}')
+    return seqs
+
+
+def fasta_header(fasta_handle, offset):
+    # In samtools FAI, offset locates the first sequence base. The immediately
+    # preceding FASTA line contains the header. Read a short chunk, not sequence.
+    n = min(offset, 65536)
+    fasta_handle.seek(offset - n)
+    payload = fasta_handle.read(n).rstrip(b'\r\n')
+    line = payload.rsplit(b'\n', 1)[-1].decode('utf-8', 'replace').lstrip('\r')
+    return line[1:] if line.startswith('>') else ''
+
+
+def status_of(seqid, header):
+    if ORGANELLE.search(seqid) or ORGANELLE.search(header):
+        return 'ORGANELLE_EXCLUDE'
+    if NONPRIMARY.search(seqid) or NONPRIMARY.search(header):
+        return 'NONPRIMARY_OR_SCAFFOLD'
+    if EMBEDDED_CHR.search(seqid):
+        return 'CHR_IN_SEQ_ID_REVIEW'
+    if GENERIC_CHR.search(header):
+        return 'CHROMOSOME_IN_HEADER_REVIEW'
+    if ACCESSION.match(seqid):
+        return 'ACCESSION_NEEDS_ASSEMBLY_REPORT'
+    return 'UNKNOWN_REVIEW'
+
+
+def process(workdir, top_n):
+    selection = load_tsv(workdir / 'selected_75_genomes.tsv')
+    before = load_tsv(workdir / 'chromosome_candidates_75.tsv')
+    if len(selection) != 75 or len(before) != 75:
+        raise ValueError(f'Expected 75 selected and 75 candidate rows, got {len(selection)} and {len(before)}')
+    selected_by_name = {r['PREFIX']: r for r in selection}
+    target = []
+    for r in before:
+        if r['RULE'] == 'NONE' or (r['RULE'] != 'NONE' and float(r['CANDIDATE_PCT']) < 90):
+            target.append(r)
+    summary = []
+    details = []
+    named = []
+    for k, row in enumerate(target, 1):
+        sp = row['PREFIX']
+        srow = selected_by_name[sp]
+        fasta = Path(srow['SOURCE_DIR']) / srow['FASTA_FILENAME']
+        if not fasta.is_file():
+            raise FileNotFoundError(fasta)
+        seqs = read_fai(fasta)
+        ordered = sorted(seqs, key=lambda r: r[1], reverse=True)
+        total = sum(x[1] for x in seqs)
+        keep = {t[0] for t in ordered[:top_n]}
+        # Also inspect namespaced Chr IDs throughout the entire FAI.
+        keep.update(x[0] for x in seqs if EMBEDDED_CHR.search(x[0]))
+        selected_pairs = []
+        with fasta.open('rb') as handle:
+            for seqid, length, offset in seqs:
+                if seqid not in keep:
+                    continue
+                header = fasta_header(handle, offset)
+                flag = status_of(seqid, header)
+                selected_pairs.append((seqid, length, flag))
+                details.append({
+                    'PREFIX': sp, 'EXISTING_RULE': row['RULE'],
+                    'SEQ_ID': seqid, 'LENGTH_BP': length,
+                    'LENGTH_MB': f'{length / 1e6:.3f}',
+                    'PERCENT_ASSEMBLY': f'{length / total * 100:.3f}',
+                    'SECOND_PASS_FLAG': flag,
+                    'FASTA_HEADER': header[:300] if header else '(not accessible from .fai offset)',
+                })
+                if flag == 'CHR_IN_SEQ_ID_REVIEW':
+                    named.append({'PREFIX': sp, 'SEQ_ID': seqid, 'LENGTH_BP': length,
+                                  'SECOND_PASS_FLAG': flag})
+        c = Counter(x[2] for x in selected_pairs)
+        top10 = sum(x[1] for x in ordered[:10])
+        top20 = sum(x[1] for x in ordered[:20])
+        summary.append({
+            'PREFIX': sp, 'ASSEMBLY_OR_SOURCE': row['ASSEMBLY_OR_SOURCE'],
+            'PREVIOUS_RULE': row['RULE'], 'ASSEMBLY_SEQS': len(seqs),
+            'ASSEMBLY_MB': f'{total / 1e6:.2f}',
+            'TOP10_PCT': f'{100 * top10 / total:.2f}',
+            'TOP20_PCT': f'{100 * top20 / total:.2f}',
+            'NAMESPACED_CHR_IDS': c['CHR_IN_SEQ_ID_REVIEW'],
+            'HEADER_CHR_IN_AUDITED_SEQS': c['CHROMOSOME_IN_HEADER_REVIEW'],
+            'CANDIDATE_ASSEMBLY_FRACTION_PCT': row['CANDIDATE_PCT'],
+            'ACTION': 'CHECK_SEQUENCE_REPORT_AND_HEADERS',
+        })
+        print(f'[{k:02d}/{len(target)}] {sp}: '
+              f'{len(seqs)} seqs, namespaced Chr IDs={c["CHR_IN_SEQ_ID_REVIEW"]}, '
+              f'top10={100 * top10 / total:.1f}%', flush=True)
+    write_tsv(workdir / 'second_round_summary_75.tsv',
+              ['PREFIX', 'ASSEMBLY_OR_SOURCE', 'PREVIOUS_RULE', 'ASSEMBLY_SEQS',
+               'ASSEMBLY_MB', 'TOP10_PCT', 'TOP20_PCT', 'NAMESPACED_CHR_IDS',
+               'HEADER_CHR_IN_AUDITED_SEQS', 'CANDIDATE_ASSEMBLY_FRACTION_PCT', 'ACTION'],
+              summary)
+    write_tsv(workdir / 'second_round_details_75.tsv',
+              ['PREFIX', 'EXISTING_RULE', 'SEQ_ID', 'LENGTH_BP', 'LENGTH_MB',
+               'PERCENT_ASSEMBLY', 'SECOND_PASS_FLAG', 'FASTA_HEADER'], details)
+    write_tsv(workdir / 'second_round_namespaced_chr_75.tsv',
+              ['PREFIX', 'SEQ_ID', 'LENGTH_BP', 'SECOND_PASS_FLAG'], named)
+    print(f'[DONE] audited {len(target)} species; wrote three TSV files to {workdir}')
+    print('[NOTE] No predictions, decisions, final chromsizes or runlists were modified.')
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--workdir', type=Path, default=DEFAULT_WORKDIR)
+    p.add_argument('--top', type=int, default=20, help='Inspect top N longest sequences per reviewed species (default 20)')
+    args = p.parse_args()
+    if args.top < 1:
+        p.error('--top must be >= 1')
+    process(args.workdir, args.top)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, KeyError) as exc:
+        print('[ERROR]', exc, file=sys.stderr)
+        sys.exit(1)
+
+python3 audit_primary_sequences_75.py
+#查看结果：second_round_summary_75.tsv：每个被审计物种的汇总；second_round_details_75.tsv：具体检查了哪些序列及其判断结果；second_round_namespaced_chr_75.tsv：专门列出名字里带 Chr 的序列
+#在detail的表里面能看到一些header里是有写几号染色体的，以上脚本只查看了最长并且名字带chr的一些header
+#前面有28个是none，但也有5个虽然能选出主染色体，但是其覆盖比例较低，对这33个物种重新检查，会生成候选染色体id文件
+vim audit_all_headers_33.py
+#!/usr/bin/env python3
+"""Full-header chromosome audit for the 33 flagged legume genomes.
+
+Read-only toward source genomes, previous reports, decisions and prediction inputs.
+Scans all FAI entries of the 33 flagged genomes, not just top-20 sequences.
+Produces full_primary_audit_33.tsv, full_primary_candidate_ids_33.tsv,
+and drafts in draft_primary_seqids/ (NOT manual_seqids/).
+
+Usage:
+  cd /data/mshe/deepRloopPro_data/rlooppre_75
+  python3 audit_all_headers_33.py
+
+Optional:
+  python3 audit_all_headers_33.py --workdir /path/to/rlooppre_75
+
+IMPORTANT: inferred chromosome labels are CANDIDATES. Verify counts, IDs,
+assembly metadata, organelle exclusion before copying any drafts into
+manual_seqids/ and setting USE_ID_FILE in chromosome_decisions_75.tsv.
+"""
+import argparse
+import csv
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+DEFAULT_DIR = Path('/data/mshe/deepRloopPro_data/rlooppre_75')
+
+# Chromosome names may appear as IDs (Gsin.Chr01), or as header labels
+# (chromosome: 1, chromosome 01_Occ, chromosome LG11, Glur_chr1).
+SEQ_CHR_RE = re.compile(
+    r'(?:^|[._-])chr(?:omosome)?[-_.]?0*[1-9][0-9]{0,2}(?:[ABCDLS])?(?=$|[._-])', re.I)
+HEADER_CHROM_RE = re.compile(
+    r'\bchromosome\s*[:=_ -]\s*(?:'
+    r'0*[1-9][0-9]{0,2}(?:[ABCDLS])?(?:_[A-Za-z0-9]+)?'
+    r'|LG[-_ ]?0*[1-9][0-9]{0,2}'
+    r'|[IVX]{1,4}|[XYZW])(?=$|[\s,;.\t])', re.I)
+HEADER_ALIAS_RE = re.compile(
+    r'(?:^|[._-])chr0*[1-9][0-9]{0,2}(?:[ABCDLS])?(?=$|[.,;\s_\-])', re.I)
+ORGANELLE_RE = re.compile(
+    r'chloroplast|plastid|mitochondri|mitogenom|organelle|\bchr[CM]\b|'
+    r'chromosome\s*[:=_ -]\s*[CM](?=$|[\s,;.\t])', re.I)
+NONPRIMARY_RE = re.compile(
+    r'unlocalized|unplaced|alternate[ _-](?:haplotype|locus)|'
+    r'\bscaffold\b|scaffold[_ -]|\bcontig\b|contig[_ -]|'
+    r'\bpatch\b|\brandom\b', re.I)
+
+SUMMARY_COLS = [
+    'PREFIX', 'PREVIOUS_RULE', 'FASTA_SEQS', 'ASSEMBLY_MB',
+    'PREVIOUS_CANDIDATE_PCT', 'HEADER_CHROM_SEQS', 'SEQID_CHR_SEQS',
+    'HEADER_ALIAS_CHR_SEQS', 'PRIMARY_CANDIDATE_SEQS',
+    'PRIMARY_CANDIDATE_BP', 'PRIMARY_CANDIDATE_PCT',
+    'ORGANELLE_SEQS', 'NONPRIMARY_SEQS', 'HEADER_UNREADABLE_SEQS',
+    'STATUS', 'NEXT_ACTION', 'NOTES',
+]
+DETAIL_COLS = ['PREFIX', 'SEQ_ID', 'LENGTH_BP', 'EVIDENCE', 'FASTA_HEADER']
+
+
+def read_tsv(path):
+    with path.open('r', encoding='utf-8', newline='') as handle:
+        return list(csv.DictReader(handle, delimiter='\t'))
+
+
+def write_tsv(path, fields, records):
+    tmp = path.with_name(path.name + '.tmp')
+    with tmp.open('w', encoding='utf-8', newline='') as handle:
+        w = csv.DictWriter(handle, fieldnames=fields, delimiter='\t',
+                           lineterminator='\n', extrasaction='ignore')
+        w.writeheader()
+        w.writerows(records)
+    tmp.replace(path)
+
+
+def fasta_header(handle, offset):
+    """Use samtools fai sequence offsets to read the preceding FASTA title.
+
+    Start with a short block; retry for unusually long FASTA descriptions.
+    Input FASTA should be uncompressed, as in the user's 75-genome manifest.
+    """
+    for limit in (2048, 65536):
+        n = min(limit, offset)
+        handle.seek(offset - n)
+        payload = handle.read(n).rstrip(b'\r\n')
+        last_line = payload.rsplit(b'\n', 1)[-1].lstrip(b'\r')
+        if last_line.startswith(b'>'):
+            return last_line[1:].decode('utf-8', 'replace')
+    return ''
+
+
+def classify(seqid, header):
+    combined = seqid + ' ' + header
+    if ORGANELLE_RE.search(combined):
+        return 'ORGANELLE'
+    if NONPRIMARY_RE.search(combined):
+        return 'NONPRIMARY_OR_SCAFFOLD'
+    if SEQ_CHR_RE.search(seqid):
+        return 'SEQID_CHR'
+    if HEADER_CHROM_RE.search(header):
+        return 'HEADER_CHROM'
+    if HEADER_ALIAS_RE.search(header):
+        return 'HEADER_ALIAS_CHR'
+    return 'UNRESOLVED'
+
+
+def scan_one(species, fasta, info):
+    fai = Path(str(fasta) + '.fai')
+    if not fasta.is_file() or not fai.is_file() or fasta.stat().st_size == 0:
+        raise FileNotFoundError(f'FASTA/FAI missing: {fasta} / {fai}')
+    if fai.stat().st_mtime < fasta.stat().st_mtime:
+        raise ValueError(f'FAI older than FASTA, rerun samtools faidx: {fasta}')
+    stats = Counter()
+    accepted = []
+    detail_rows = []
+    total_bp = 0
+    with fasta.open('rb') as fh, fai.open('r', encoding='utf-8') as fx:
+        for i, raw in enumerate(fx, 1):
+            fields = raw.rstrip('\r\n').split('\t')
+            if len(fields) < 3:
+                raise ValueError(f'Invalid FAI {fai}:{i}')
+            seqid, bp, offset = fields[0], int(fields[1]), int(fields[2])
+            if bp <= 0 or offset < 0:
+                raise ValueError(f'Invalid length/offset in {fai}:{i}')
+            total_bp += bp
+            title = fasta_header(fh, offset)
+            flag = classify(seqid, title)
+            stats[flag] += 1
+            stats['ALL'] += 1
+            if not title:
+                stats['UNREADABLE_HEADER'] += 1
+            if flag in {'SEQID_CHR', 'HEADER_CHROM', 'HEADER_ALIAS_CHR'}:
+                accepted.append((seqid, bp))
+                detail_rows.append({
+                    'PREFIX': species, 'SEQ_ID': seqid,
+                    'LENGTH_BP': bp, 'EVIDENCE': flag,
+                    'FASTA_HEADER': title[:400]
+                })
+
+    expected = int(info['ASSEMBLY_SEQS'])
+    if stats['ALL'] != expected:
+        raise ValueError(f'{species}: FAI count changed from second round: '
+                         f"{stats['ALL']} != {expected}")
+    if len(accepted) != len(set(s for s, _ in accepted)):
+        raise ValueError(f'{species}: duplicate selected seqIDs')
+    chosen_bp = sum(bp for _, bp in accepted)
+    frac = 100.0 * chosen_bp / total_bp
+    if accepted:
+        status = 'EXPLICIT_CHROMOSOME_CANDIDATES'
+        action = 'VERIFY_COMPLETE_IDS_AND_ASSEMBLY_THEN_USE_ID_FILE'
+    else:
+        status = 'NO_EXPLICIT_CHROMOSOME_LABEL'
+        action = 'VERIFY_ASSEMBLY_LEVEL_AND_DECIDE_NUCLEAR_SCAFFOLD_FALLBACK'
+    if stats['UNREADABLE_HEADER']:
+        action = 'FIX_UNREADABLE_HEADERS_BEFORE_DECIDING'
+    # Highlight a discrepancy between the new complete scan and prior CM/NC candidates.
+    notes = []
+    old_pct = float(info['CANDIDATE_ASSEMBLY_FRACTION_PCT'])
+    if info['PREVIOUS_RULE'] != 'NONE' and abs(frac - old_pct) > 1.0:
+        notes.append('DIFFERS_FROM_PREVIOUS_CANDIDATE_PCT')
+    if frac < 60 and accepted:
+        notes.append('LOW_SELECTED_FRACTION')
+    if species in ('Ononis_reclinata', 'Laburnum_anagyroides'):
+        notes.append('FULL_SCAN_CRITICAL_TOP20_AUDIT_WAS_TRUNCATED')
+    report = {
+        'PREFIX': species,
+        'PREVIOUS_RULE': info['PREVIOUS_RULE'],
+        'FASTA_SEQS': stats['ALL'],
+        'ASSEMBLY_MB': f'{total_bp/1e6:.3f}',
+        'PREVIOUS_CANDIDATE_PCT': info['CANDIDATE_ASSEMBLY_FRACTION_PCT'],
+        'HEADER_CHROM_SEQS': stats['HEADER_CHROM'],
+        'SEQID_CHR_SEQS': stats['SEQID_CHR'],
+        'HEADER_ALIAS_CHR_SEQS': stats['HEADER_ALIAS_CHR'],
+        'PRIMARY_CANDIDATE_SEQS': len(accepted),
+        'PRIMARY_CANDIDATE_BP': chosen_bp,
+        'PRIMARY_CANDIDATE_PCT': f'{frac:.2f}',
+        'ORGANELLE_SEQS': stats['ORGANELLE'],
+        'NONPRIMARY_SEQS': stats['NONPRIMARY_OR_SCAFFOLD'],
+        'HEADER_UNREADABLE_SEQS': stats['UNREADABLE_HEADER'],
+        'STATUS': status, 'NEXT_ACTION': action,
+        'NOTES': ';'.join(notes),
+    }
+    return report, detail_rows, accepted
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--workdir', type=Path, default=DEFAULT_DIR)
+    args = p.parse_args()
+    work = args.workdir
+    selection = read_tsv(work / 'selected_75_genomes.tsv')
+    audit = read_tsv(work / 'second_round_summary_75.tsv')
+    if len(selection) != 75 or len(audit) != 33:
+        raise ValueError(f'Expected 75 selected and 33 second-round rows; '
+                         f'got {len(selection)} and {len(audit)}')
+    by_species = {r['PREFIX']: r for r in selection}
+    if len(by_species) != 75 or len({r['PREFIX'] for r in audit}) != 33:
+        raise ValueError('Duplicate species in input files')
+    reports, details = [], []
+    draft_dir = work / 'draft_primary_seqids'
+    draft_dir.mkdir(parents=True, exist_ok=True)
+    for i, r in enumerate(audit, 1):
+        sp = r['PREFIX']
+        if sp not in by_species:
+            raise ValueError(f'Species not in selection: {sp}')
+        src = by_species[sp]
+        fasta = Path(src['SOURCE_DIR']) / src['FASTA_FILENAME']
+        report, detail, accepted = scan_one(sp, fasta, r)
+        reports.append(report)
+        details.extend(detail)
+        draft_path = draft_dir / f'{sp}.txt'
+        if accepted:
+            draft_path.write_text(''.join(f'{seq}\n' for seq, _ in accepted),
+                                  encoding='utf-8')
+        elif draft_path.exists():
+            draft_path.unlink()
+        print(f'[{i:02d}/33] {sp}: '
+              f"{report['PRIMARY_CANDIDATE_SEQS']} explicit chromosome labels, "
+              f"{report['PRIMARY_CANDIDATE_PCT']}%", flush=True)
+    write_tsv(work / 'full_primary_audit_33.tsv', SUMMARY_COLS, reports)
+    write_tsv(work / 'full_primary_candidate_ids_33.tsv', DETAIL_COLS, details)
+    print(f'[DONE] {len(reports)} species examined, '
+          f'{sum(r["PRIMARY_CANDIDATE_SEQS"] for r in reports)} candidate sequences')
+    print('[CAUTION] Draft ID files are not final or approved; compare with assembly metadata.')
+    print(f'[OUTPUT] {work / "full_primary_audit_33.tsv"}')
+    print(f'[OUTPUT] {work / "full_primary_candidate_ids_33.tsv"}')
+    print(f'[OUTPUT] {draft_dir}')
+    print('[SAFE] Existing chromosome_decisions_75.tsv, manual_seqids, final '
+          'chromsizes and deepRloop run lists were NOT changed.')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, KeyError) as exc:
+        print('[ERROR]', exc, file=sys.stderr)
+        sys.exit(1)
+
+python3 audit_all_headers_33.py
+#查看full_primary_audit_33.tsv，可发现Acmispon_strigosus，Adenanthera_pavonina，Castanospermum_australe，Dicorynia_guianensis，Erythrophleum_ivorense，Nissolia_brasiliensis，
+#Prosopis_cineraria，Styphnolobium_japonicum，Tylosema_esculentum，这9个物种没有识别出明确的染色体id，查询过组装信息之后可发现Cajanus_cajan_GCF_000230855.2比原来的GCF_000340665.2版本更完整，
+#Acmispon_strigosus这个的基因组文献报道前7条是染色体级scaffold，Styphnolobium_japonicum的基因组文献说前14条是染色体级，Prosopis_cineraria的基因组论文报道最长的14条接近染色体级别装配，这3个需要单独生成主染色体文件
+#检查木豆的序列名
+FASTA=/data/mshe/deepRloopPro_data/legume_phylogeny/03_public_annotation/genome/Cajanus_cajan_GCF_000230855.2.fna
+samtools faidx "$FASTA"
+head -n 15 "${FASTA}.fai"
+#修改rloop的物种选择清单
+cd /data/mshe/deepRloopPro_data/rlooppre_75
+vim selected_75_genomes.tsv
+#将cajan那一列换成Cajanus_cajan	GCF_000230855.2	/data/mshe/deepRloopPro_data/legume_phylogeny/03_public_annotation/genome	Cajanus_cajan_GCF_000230855.2.fna
+#单独生成Acmispon_strigosus，Prosopis_cineraria，Styphnolobium_japonicum的主染色体文件
+cat > prepare_special_3_chromsizes.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================
+# 1. 设置路径
+# =============================================
+BASE=/data/mshe/deepRloopPro_data
+FASTA_DIR="$BASE/legume_phylogeny/00_genomes/genomes_fasta"
+WORK="$BASE/rlooppre_75"
+
+OUT="$WORK/chromsizes_special_3"
+ID_OUT="$WORK/manual_seqids"
+
+mkdir -p "$WORK"
+
+TMP=$(mktemp -d "$WORK/.special3.XXXXXX")
+trap 'rm -rf "$TMP"' EXIT
+
+# =============================================
+# 2. 指定已核对的序列ID
+# =============================================
+
+# Acmispon：7条假染色体
+for i in {1..7}; do
+    printf 'JAUAMA01%07d.1\n' "$i"
+done > "$TMP/Acmispon_strigosus.ids"
+
+# Styphnolobium：14条假染色体
+for i in {1..14}; do
+    printf 'JALBWW01%07d.1\n' "$i"
+done > "$TMP/Styphnolobium_japonicum.ids"
+
+# Prosopis：14条近染色体级scaffold
+for i in {332..345}; do
+    printf 'NW_026555%d.1\n' "$i"
+done > "$TMP/Prosopis_cineraria.ids"
+
+# =============================================
+# 3. 检查并生成chromsize
+# =============================================
+
+process_one() {
+    local species="$1"
+    local accession="$2"
+    local expected_n="$3"
+    local expected_bp="$4"
+    local expected_total="$5"
+
+    local fasta="$FASTA_DIR/${species}_${accession}.fna"
+    local fai="${fasta}.fai"
+    local ids="$TMP/${species}.ids"
+    local chrom="$TMP/${species}.chrom.sizes"
+
+    echo "=================================="
+    echo "[CHECK] $species"
+
+    if [[ ! -s "$fasta" ]]; then
+        echo "[ERROR] FASTA missing: $fasta" >&2
+        return 1
+    fi
+
+    # 没有FAI或索引过期时，重新建立索引
+    if [[ ! -s "$fai" || "$fasta" -nt "$fai" ]]; then
+        samtools faidx "$fasta"
+    fi
+
+    # 依据指定ID，从FAI中提取对应长度
+    # 同时检查所有指定ID是否存在且唯一
+    awk -F '\t' '
+    NR==FNR {
+        wanted[$1]++
+        next
+    }
+    ($1 in wanted) {
+        print $1 "\t" $2
+        found[$1]++
+    }
+    END {
+        for (id in wanted) {
+            if (wanted[id] != 1 || found[id] != 1) {
+                print "[ERROR] Missing or duplicate ID:", id > "/dev/stderr"
+                bad=1
+            }
+        }
+        if (bad) exit 1
+    }' "$ids" "$fai" > "$chrom"
+
+    # 统计长度和数量
+    local n bp total pct
+
+    n=$(wc -l < "$chrom")
+
+    bp=$(awk '{s+=$2} END {printf "%.0f",s}' "$chrom")
+
+    total=$(awk '{s+=$2} END {printf "%.0f",s}' "$fai")
+
+    pct=$(awk -v a="$bp" -v b="$total" \
+        'BEGIN {printf "%.2f",100*a/b}')
+
+    echo "Selected sequences: $n"
+    echo "Selected length:    $bp bp"
+    echo "Assembly length:    $total bp"
+    echo "Selected fraction:  $pct%"
+
+    # 检查结果是否和前期核验一致
+    if [[ "$n" -ne "$expected_n" ||
+          "$bp" -ne "$expected_bp" ||
+          "$total" -ne "$expected_total" ]]; then
+        echo "[ERROR] Unexpected count or length!" >&2
+        return 1
+    fi
+
+    echo "[PASS] $species"
+}
+
+# =============================================
+# 4. 处理三个物种
+# =============================================
+
+process_one \
+    Acmispon_strigosus \
+    GCA_030819835.1 \
+    7 486124685 510350846
+
+process_one \
+    Styphnolobium_japonicum \
+    GCA_023212625.1 \
+    14 468603609 511488806
+
+process_one \
+    Prosopis_cineraria \
+    GCF_029017545.1 \
+    14 594687247 691555879
+
+# =============================================
+# 5. 全部核验通过后保存文件
+# =============================================
+
+mkdir -p "$OUT" "$ID_OUT"
+
+for species in \
+    Acmispon_strigosus \
+    Styphnolobium_japonicum \
+    Prosopis_cineraria
+do
+    mv "$TMP/${species}.chrom.sizes" \
+       "$OUT/${species}.chrom.sizes"
+
+    mv "$TMP/${species}.ids" \
+       "$ID_OUT/${species}.txt"
+done
+
+echo "=================================="
+echo "[ALL PASS] Three species completed."
+echo "Chromsize directory: $OUT"
+echo "Sequence ID directory: $ID_OUT"
+BASH
+
+chmod +x prepare_special_3_chromsizes.sh
+bash prepare_special_3_chromsizes.sh
+#核对选取的序列id和序列数，由于木豆已换基因组文件，重新运行检查
+python3 prepare_primary_chromsizes_75.py --inspect
+
+#因为之前有些物种是跑过的，所以看看哪些可以不用重跑
+BASE=/data/mshe/deepRloopPro_data
+
+while read -r PREFIX FASTA CHROM; do
+    FWD="$BASE/deepRloop_results_A/${PREFIX}_final_predict.bed"
+    REV="$BASE/deepRloop_results_A_rev/${PREFIX}_rev_final_predict.bed"
+
+    fwd_status="NO"
+    rev_status="NO"
+
+    [[ -s "$FWD" ]] && fwd_status="YES"
+    [[ -s "$REV" ]] && rev_status="YES"
+
+    printf "%-46s FWD=%-3s REV=%-3s\n" \
+        "$PREFIX" "$fwd_status" "$rev_status"
+
+done < "$BASE/new_list_A.tsv"
+#检查原来20个物种的chromosize文件
+BASE=/data/mshe/deepRloopPro_data
+while read -r PREFIX FASTA CHROM FAI
+do
+    if [[ ! -s "$CHROM" ]]; then
+        echo "[MISSING] $PREFIX"
+        continue
+    fi
+
+    awk -v sp="$PREFIX" '
+    {
+        n++
+        total += $2
+    }
+    END {
+        printf "%-46s %5d sequences  %10.2f Mb\n",
+        sp,n,total/1000000
+    }' "$CHROM"
+
+done < "$BASE/new_list_A.tsv"
+#比较新旧chromosize确认可直接用预测结果的物种
+BASE=/data/mshe/deepRloopPro_data
+WORK="$BASE/rlooppre_75"
+
+while read -r PREFIX FASTA OLD_CHROM FAI
+do
+    # 正确提取物种名称（属名_种名）
+    SPECIES=$(echo "$PREFIX" | cut -d_ -f1,2)
+
+    NEW_CHROM="$WORK/candidate_chromsizes/${SPECIES}.candidate.chrom.sizes"
+
+    # 检查新旧chromsize是否存在
+    if [[ ! -s "$NEW_CHROM" ]]; then
+        echo "[NO_CANDIDATE] $SPECIES"
+        continue
+    fi
+
+    if [[ ! -s "$OLD_CHROM" ]]; then
+        echo "[NO_OLD] $SPECIES"
+        continue
+    fi
+
+    # 比较序列ID及长度
+    if diff -q \
+        <(awk 'NF>=2 {print $1 "\t" $2}' "$OLD_CHROM" | LC_ALL=C sort) \
+        <(awk 'NF>=2 {print $1 "\t" $2}' "$NEW_CHROM" | LC_ALL=C sort) \
+        >/dev/null
+    then
+        echo "[SAME] $SPECIES"
+    else
+        echo "[DIFF] $SPECIES"
+    fi
+
+done < "$BASE/new_list_A.tsv"
+#有7个较特殊的新版还没对比上，重新对比
+BASE=/data/mshe/deepRloopPro_data
+WORK="$BASE/rlooppre_75"
+
+for sp in \
+Mimosa_bimucronata \
+Arachis_hypogaea \
+Vicia_faba \
+Lathyrus_oleraceus \
+Trifolium_repens \
+Lablab_purpureus \
+Chamaecrista_fasciculata
+do
+    # 旧版预测使用的chromsize
+    OLD=$(awk -v sp="$sp" \
+        'index($1,sp"_")==1 {print $3; exit}' \
+        "$BASE/new_list_A.tsv")
+
+    # 现在选定的基因组FASTA
+    FASTA=$(awk -v sp="$sp" \
+        '$1==sp {print $3 "/" $4; exit}' \
+        "$WORK/selected_75_genomes.tsv")
+
+    # 第二轮审核得到的染色体ID
+    IDS="$WORK/draft_primary_seqids/${sp}.txt"
+
+    if [[ ! -s "$OLD" || ! -s "${FASTA}.fai" || ! -s "$IDS" ]]; then
+        echo "[MISSING_INPUT] $sp"
+        continue
+    fi
+
+    # 根据候选ID，从当前FAI提取染色体长度
+    TMP=$(mktemp)
+
+    if ! awk 'NR==FNR {
+        wanted[$1]=1
+        n++
+        next
+    }
+    $1 in wanted {
+        print $1 "\t" $2
+        found++
+    }
+    END {
+        if (found != n) exit 1
+    }' "$IDS" "${FASTA}.fai" > "$TMP"; then
+        echo "[ID_MISMATCH] $sp"
+        rm -f "$TMP"
+        continue
+    fi
+
+    if diff -q \
+        <(sort -k1,1 "$OLD") \
+        <(sort -k1,1 "$TMP") >/dev/null
+    then
+        echo "[SAME] $sp"
+    else
+        echo "[DIFF] $sp"
+    fi
+
+    rm -f "$TMP"
+done
+#根据序列id和顺序提取新旧染色体序列比较碱基序列
+BASE=/data/mshe/deepRloopPro_data
+WORK="$BASE/rlooppre_75"
+
+set -o pipefail
+
+while read -r PREFIX OLD_FASTA OLD_CHROM FAI
+do
+    SP=$(echo "$PREFIX" | cut -d_ -f1,2)
+
+    # 木豆已经更换组装，直接跳过
+    if [[ "$SP" == "Cajanus_cajan" ]]; then
+        echo "[REBUILD] $SP"
+        continue
+    fi
+
+    # 获取当前75物种使用的FASTA路径
+    NEW_FASTA=$(awk -F '\t' -v sp="$SP" \
+        '$1==sp {print $3 "/" $4; exit}' \
+        "$WORK/selected_75_genomes.tsv")
+
+    if [[ ! -s "$OLD_FASTA" ||
+          ! -s "$NEW_FASTA" ||
+          ! -s "$OLD_CHROM" ]]; then
+        echo "[MISSING] $SP"
+        continue
+    fi
+
+    # 获取旧预测实际使用的染色体ID
+    mapfile -t IDS < <(
+        awk 'NF>=2 {print $1}' "$OLD_CHROM"
+    )
+
+    if (( ${#IDS[@]} == 0 )); then
+        echo "[ERROR] Empty chromosome list: $SP"
+        continue
+    fi
+
+    echo "[CHECK] $SP"
+
+    # 计算旧版主染色体序列的SHA256
+    OLD_HASH=$(samtools faidx "$OLD_FASTA" "${IDS[@]}" \
+        | sha256sum | awk '{print $1}') || {
+        echo "[ERROR_OLD] $SP"
+        continue
+    }
+
+    # 计算新版主染色体序列的SHA256
+    NEW_HASH=$(samtools faidx "$NEW_FASTA" "${IDS[@]}" \
+        | sha256sum | awk '{print $1}') || {
+        echo "[ERROR_NEW] $SP"
+        continue
+    }
+
+    if [[ "$OLD_HASH" == "$NEW_HASH" ]]; then
+        echo "[SAME_SEQ] $SP"
+    else
+        echo "[DIFF_SEQ] $SP"
+    fi
+
+done < "$BASE/new_list_A.tsv"
+
+#先生成决策表，那69个确定是有chromosome级别的就pass，剩余6个scaffold先不做看看
+(
+set -euo pipefail
+
+cd /data/mshe/deepRloopPro_data/rlooppre_75
+
+# 1. 整合人工筛选的ID文件，不覆盖已有文件
+mkdir -p manual_seqids
+
+for f in draft_primary_seqids/*.txt; do
+    [[ -s "$f" ]] || continue
+    sp=${f##*/}
+    sp=${sp%.txt}
+
+    if [[ ! -e "manual_seqids/${sp}.txt" ]]; then
+        cp "$f" "manual_seqids/${sp}.txt"
+    fi
+done
+
+# 2. 整理自动识别和人工筛选的物种
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+awk -F '\t' '
+NR>1 && $3 ~ /^(CM|NC|CHR)$/ {print $1}
+' chromosome_candidates_75.tsv > "$TMP/auto"
+
+for f in manual_seqids/*.txt; do
+    [[ -s "$f" ]] && basename "$f" .txt
+done > "$TMP/manual"
+
+# 3. 生成决策表
+awk -F '\t' -v OFS='\t' '
+FILENAME==ARGV[1] {
+    auto[$1]=1
+    next
+}
+FILENAME==ARGV[2] {
+    manual[$1]=1
+    next
+}
+FNR==1 {
+    print "PREFIX","ACTION","NOTE"
+    next
+}
+{
+    sp=$1
+
+    if (sp=="Adenanthera_pavonina" ||
+        sp=="Castanospermum_australe" ||
+        sp=="Dicorynia_guianensis" ||
+        sp=="Erythrophleum_ivorense" ||
+        sp=="Nissolia_brasiliensis" ||
+        sp=="Tylosema_esculentum") {
+        print sp,"","PENDING_SCAFFOLD"
+    }
+    else if (sp in auto) {
+        print sp,"APPROVE_CANDIDATE","AUTO_CHROMOSOME"
+    }
+    else if (sp in manual) {
+        print sp,"USE_ID_FILE","MANUAL_SEQIDS"
+    }
+    else {
+        print "[ERROR] Missing IDs: " sp > "/dev/stderr"
+        bad=1
+        print sp,"","MISSING_SEQIDS"
+    }
+}
+END {
+    if (bad) exit 1
+}
+' "$TMP/auto" "$TMP/manual" chromosome_decisions_75.tsv \
+> "$TMP/new_decisions.tsv"
+
+# 4. 核对数量，正确才覆盖原文件
+awk -F '\t' '
+NR>1 {
+    total++
+    if ($2=="APPROVE_CANDIDATE") a++
+    else if ($2=="USE_ID_FILE") b++
+    else if ($3=="PENDING_SCAFFOLD") c++
+}
+END {
+    print "Total species:",total
+    print "APPROVE_CANDIDATE:",a+0
+    print "USE_ID_FILE:",b+0
+    print "PENDING_SCAFFOLD:",c+0
+
+    if (total!=75 || a!=47 || b!=22 || c!=6)
+        exit 1
+}
+' "$TMP/new_decisions.tsv"
+
+# 5. 备份并更新决策表
+cp -p chromosome_decisions_75.tsv \
+    "chromosome_decisions_75.tsv.bak.$(date +%Y%m%d_%H%M%S)"
+
+cp "$TMP/new_decisions.tsv" chromosome_decisions_75.tsv
+
+echo "[PASS] Decision table updated."
+)
+#生成69个物种的chromosize文件
+(
+set -euo pipefail
+
+BASE=/data/mshe/deepRloopPro_data
+WORK="$BASE/rlooppre_75"
+OUT="$WORK/chromsizes_primary_69"
+RUN="$WORK/run_list_new50_primary.tsv"
+
+cd "$WORK"
+mkdir -p "$OUT"
+: > "$RUN"
+
+n=0
+
+while IFS=$'\t' read -r SP ACTION
+do
+    ACC=$(awk -F '\t' -v sp="$SP" \
+        '$1==sp {print $2; exit}' selected_75_genomes.tsv)
+
+    FASTA=$(awk -F '\t' -v sp="$SP" \
+        '$1==sp {print $3 "/" $4; exit}' selected_75_genomes.tsv)
+
+    [[ -n "$ACC" && -s "$FASTA" && -s "${FASTA}.fai" ]] || {
+        echo "[ERROR] Missing genome or FAI: $SP"
+        exit 1
+    }
+
+    CHROM="$OUT/${SP}.chrom.sizes"
+    TMP="${CHROM}.tmp"
+
+    if [[ "$ACTION" == "APPROVE_CANDIDATE" ]]; then
+
+        cp "$WORK/candidate_chromsizes/${SP}.candidate.chrom.sizes" "$TMP"
+
+    elif [[ "$ACTION" == "USE_ID_FILE" ]]; then
+
+        IDS="$WORK/manual_seqids/${SP}.txt"
+
+        [[ -s "$IDS" ]] || {
+            echo "[ERROR] Missing ID file: $SP"
+            exit 1
+        }
+
+        awk '
+        NR==FNR {
+            if ($1 in wanted) exit 1
+            wanted[$1]=1
+            order[++n]=$1
+            next
+        }
+        $1 in wanted {
+            length_bp[$1]=$2
+        }
+        END {
+            if (n==0) exit 1
+            for (i=1; i<=n; i++) {
+                id=order[i]
+                if (!(id in length_bp)) {
+                    print "[ERROR] Missing sequence ID: " id > "/dev/stderr"
+                    exit 1
+                }
+                print id "\t" length_bp[id]
+            }
+        }
+        ' "$IDS" "${FASTA}.fai" > "$TMP"
+
+    else
+        echo "[ERROR] Unknown ACTION: $SP $ACTION"
+        exit 1
+    fi
+
+    # 检查生成的chromsize是否与FAI一致
+    awk '
+    NR==FNR {ref[$1]=$2; next}
+    {
+        if (!($1 in ref) || ref[$1]!=$2 || seen[$1]++ || $2<=0)
+            exit 1
+        n++
+    }
+    END {if(n==0) exit 1}
+    ' "${FASTA}.fai" "$TMP" || {
+        echo "[ERROR] Chromsize validation failed: $SP"
+        exit 1
+    }
+
+    mv "$TMP" "$CHROM"
+    n=$((n+1))
+
+    # 19个旧物种不重复预测，木豆例外
+    if [[ "$SP" == "Cajanus_cajan" ]] ||
+       ! grep -q "^${SP}_" "$BASE/new_list_A.tsv"; then
+
+        printf "%s\t%s\t%s\n" \
+            "${SP}_${ACC}" "$FASTA" "$CHROM" >> "$RUN"
+    fi
+
+    echo "[OK] $SP"
+
+done < <(
+    awk -F '\t' 'NR>1 && $2!="" {print $1 "\t" $2}' \
+        chromosome_decisions_75.tsv
+)
+
+new_count=$(wc -l < "$RUN")
+
+echo "================================"
+echo "Generated chromsizes: $n"
+echo "New prediction species: $new_count"
+
+[[ "$n" -eq 69 && "$new_count" -eq 50 ]] || {
+    echo "[ERROR] Unexpected species count"
+    exit 1
+}
+
+echo "[PASS] Ready for prediction."
+)
+#检查结果
+find chromsizes_primary_69 -maxdepth 1 \
+    -name '*.chrom.sizes' | wc -l
+wc -l run_list_new50_primary.tsv
+head -n 5 run_list_new50_primary.tsv
+grep '^Cajanus_cajan_' run_list_new50_primary.tsv
+#正式运行脚本
+cd /data/mshe/deepRloopPro_data/rlooppre_75
+cat > run_deepRloop_50.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+WORK=/data/mshe/deepRloopPro_data/rlooppre_75
+MODEL=/home/mshe/deepRloop_models/transfer_scale128_single_13_0.29202.hdf5
+
+RUNLIST="${1:-$WORK/run_list_new50_primary.tsv}"
+MAXJOBS="${MAXJOBS:-2}"
+MEM="${MEM:-high}"
+
+OUT="$WORK/results_new50"
+LOG="$WORK/logs_new50"
+
+mkdir -p "$OUT" "$LOG"
+
+[[ -s "$MODEL" && -s "$RUNLIST" ]] || {
+    echo "[ERROR] Model or run list missing"
+    exit 1
+}
+
+[[ "$MAXJOBS" =~ ^[1-9][0-9]*$ ]] || exit 1
+
+run_one() {
+    local prefix="$1"
+    local fasta="$2"
+    local chrom="$3"
+    local strand="$4"
+    local tag="$prefix"
+
+    [[ "$strand" == "rev" ]] && tag="${prefix}_rev"
+
+    local bed="$OUT/${tag}_final_predict.bed"
+    local ok="$LOG/${tag}.ok"
+    local fail="$LOG/${tag}.fail"
+
+    # 已成功完成的任务不重复运行
+    if [[ -f "$ok" && -s "$bed" ]]; then
+        echo "[SKIP] $tag"
+        return 0
+    fi
+
+    rm -f "$ok" "$fail" "$bed"
+
+    echo "[START] $tag"
+
+    if (
+        cd "$OUT"
+        deepRloopPredict.py \
+            --h5 "$MODEL" \
+            --fasta "$fasta" \
+            --chromsize "$chrom" \
+            --prefix "$tag" \
+            --strand "$strand" \
+            --threshold 0.5 \
+            --mem "$MEM"
+    ) > "$LOG/${tag}.log" 2>&1 && [[ -s "$bed" ]]
+    then
+        touch "$ok"
+        echo "[DONE] $tag"
+    else
+        touch "$fail"
+        echo "[FAIL] $tag (see $LOG/${tag}.log)"
+        return 1
+    fi
+}
+
+pids=()
+failed=0
+
+while IFS=$'\t' read -r prefix fasta chrom
+do
+    [[ -n "$prefix" ]] || continue
+
+    if [[ ! -s "$fasta" || ! -s "$chrom" ]]; then
+        echo "[ERROR] Missing input for $prefix"
+        exit 1
+    fi
+
+    for strand in fwd rev
+    do
+        run_one "$prefix" "$fasta" "$chrom" "$strand" &
+        pids+=("$!")
+
+        # 每批最多同时运行 MAXJOBS 个任务
+        if (( ${#pids[@]} >= MAXJOBS )); then
+            for pid in "${pids[@]}"; do
+                if ! wait "$pid"; then
+                    failed=$((failed+1))
+                fi
+            done
+            pids=()
+        fi
+    done
+done < "$RUNLIST"
+
+for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then
+        failed=$((failed+1))
+    fi
+done
+
+echo "============================"
+echo "Failed tasks: $failed"
+
+if (( failed > 0 )); then
+    exit 1
+fi
+echo "[ALL DONE]"
+BASH
+
+chmod +x run_deepRloop_50.sh
+#测试长度较短的四个物种
+while IFS=$'\t' read -r prefix fasta chrom
+do
+    bp=$(awk '{s+=$2} END {printf "%.0f",s}' "$chrom")
+    printf "%s\t%s\t%s\t%s\n" \
+        "$bp" "$prefix" "$fasta" "$chrom"
+
+done < run_list_new50_primary.tsv \
+| sort -n -k1,1 \
+| head -n 4 \
+| cut -f2- > run_list_pilot4.tsv
+
+echo "=== 第一批物种 ==="
+cut -f1 run_list_pilot4.tsv
+echo "=== 磁盘空间 ==="
+df -h .
+conda activate deepRloopPre
+MAXJOBS=2 bash run_deepRloop_50.sh run_list_pilot4.tsv
+###看gpu没什么动静，直接上强度
+awk '
+NR==FNR {
+    pilot[$1]=1
+    next
+}
+!($1 in pilot) {
+    print
+}
+' run_list_pilot4.tsv run_list_new50_primary.tsv \
+> run_list_remaining46.tsv
+wc -l run_list_remaining46.tsv
+MAXJOBS=10 bash run_deepRloop_50.sh run_list_remaining46.tsv
+#中途断开了，挂后台去（nice是设定使用cpu的优先级，有其他人的任务时给他人优先分配cpu）
+nohup nice -n 10 env MAXJOBS=8 \
+bash run_deepRloop_50.sh run_list_new50_primary.tsv \
+> run_new50.nohup.log 2>&1 < /dev/null &
+tail -f run_new50.nohup.log
+#检查是否完成
+cd /data/mshe/deepRloopPro_data/rlooppre_75
+echo "=== 成功任务 ==="
+find logs_new50 -maxdepth 1 -name '*.ok' | wc -l
+echo "=== 失败任务 ==="
+find logs_new50 -maxdepth 1 -name '*.fail' | wc -l
+echo "=== 非空BED文件 ==="
+find results_new50 -maxdepth 1 \
+  -name '*_final_predict.bed' -size +0c | wc -l
+echo "=== 缺失或未完成的任务 ==="
+while read -r prefix fasta chrom; do
+    for suffix in "" "_rev"; do
+        tag="${prefix}${suffix}"
+
+        if [[ ! -f "logs_new50/${tag}.ok" ||
+              ! -s "results_new50/${tag}_final_predict.bed" ]]; then
+            echo "[CHECK] $tag"
+        fi
+    done
+done < run_list_new50_primary.tsv
+#查看bed文件是否有明显的坐标错误
+awk '
+NF < 6 || $2 < 0 || $3 <= $2 || ($6 != "+" && $6 != "-") {
+    bad++
+    if (bad <= 10) print FILENAME, FNR, $0
+}
+END {
+    print "异常BED记录数:", bad+0
+}
+' results_new50/*_final_predict.bed
+#先统计一下正链和负链Rloop覆盖比例
+cd /data/mshe/deepRloopPro_data/rlooppre_75
+cat > summarize_rloop_69.sh <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+BASE=/data/mshe/deepRloopPro_data
+WORK="$BASE/rlooppre_75"
+OUT="$WORK/rloop_summary_69.tsv"
+
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+
+summarize() {
+    local sp="$1"
+    local prefix="$2"
+    local chrom="$3"
+    local fwd="$4"
+    local rev="$5"
+    local source="$6"
+
+    for file in "$chrom" "$fwd" "$rev"; do
+        [[ -s "$file" ]] || {
+            echo "[ERROR] Missing file: $file" >&2
+            return 1
+        }
+    done
+
+    # 检查BED坐标是否在选定染色体范围内
+    awk '
+    NR==FNR {
+        size[$1]=$2
+        next
+    }
+    NF<6 || !($1 in size) ||
+    $2<0 || $3<=$2 || $3>size[$1] ||
+    ($6!="+" && $6!="-") {
+        bad++
+        if (bad<=3)
+            print "[BAD_COORD]",FILENAME,FNR,$0 > "/dev/stderr"
+    }
+    END {
+        if (bad) exit 1
+    }
+    ' "$chrom" "$fwd" "$rev"
+
+    # 正反向数量和长度
+    read -r wn wb < <(
+        awk '{n++; bp+=$3-$2}
+        END {printf "%d %.0f\n",n,bp}' "$fwd"
+    )
+
+    read -r cn cb < <(
+        awk '{n++; bp+=$3-$2}
+        END {printf "%d %.0f\n",n,bp}' "$rev"
+    )
+
+    # 预测范围总长度
+    genome=$(awk '{s+=$2}
+        END {printf "%.0f",s}' "$chrom")
+
+    # 合并正反向区间，计算不重复覆盖长度
+    covered=$(
+        awk 'BEGIN{OFS="\t"} {print $1,$2,$3}' "$fwd" "$rev" |
+        LC_ALL=C sort -k1,1 -k2,2n -k3,3n |
+        awk '
+        NR==1 {
+            chr=$1; start=$2; end=$3
+            next
+        }
+        $1==chr && $2<=end {
+            if ($3>end) end=$3
+            next
+        }
+        {
+            sum+=end-start
+            chr=$1; start=$2; end=$3
+        }
+        END {
+            if (NR>0) sum+=end-start
+            printf "%.0f\n",sum
+        }'
+    )
+
+    # 输出统计结果
+    awk -v sp="$sp" -v prefix="$prefix" \
+        -v genome="$genome" -v wn="$wn" -v wb="$wb" \
+        -v cn="$cn" -v cb="$cb" -v covered="$covered" \
+        -v source="$source" '
+    BEGIN {
+        n=wn+cn
+        mean=(n>0 ? (wb+cb)/n : 0)
+        density=n/genome*100000000
+        coverage=covered/genome*100
+
+        printf "%s\t%s\t%.0f\t%d\t%d\t%d\t%.2f\t%.2f\t%.0f\t%.4f\t%s\n",
+        sp,prefix,genome,wn,cn,n,mean,density,covered,coverage,source
+    }'
+
+    echo "[OK] $sp" >&2
+}
+
+{
+    printf "Species\tPrediction_prefix\tGenome_bp\twRloop_count\tcRloop_count\tTotal_count\tMean_length_bp\tDensity_per_100Mb\tUnion_covered_bp\tCoverage_percent\tSource\n"
+
+    # 新预测的50个物种
+    while read -r prefix fasta chrom; do
+        sp=$(echo "$prefix" | cut -d_ -f1,2)
+
+        summarize "$sp" "$prefix" "$chrom" \
+            "$WORK/results_new50/${prefix}_final_predict.bed" \
+            "$WORK/results_new50/${prefix}_rev_final_predict.bed" \
+            "NEW"
+
+    done < "$WORK/run_list_new50_primary.tsv"
+
+    # 复用旧预测的19个物种
+    while read -r prefix fasta old_chrom fai; do
+        sp=$(echo "$prefix" | cut -d_ -f1,2)
+
+        [[ "$sp" == "Cajanus_cajan" ]] && continue
+
+        summarize "$sp" "$prefix" \
+            "$WORK/chromsizes_primary_69/${sp}.chrom.sizes" \
+            "$BASE/deepRloop_results_A/${prefix}_final_predict.bed" \
+            "$BASE/deepRloop_results_A_rev/${prefix}_rev_final_predict.bed" \
+            "REUSED"
+
+    done < "$BASE/new_list_A.tsv"
+
+} > "$TMP"
+
+# 确认69个物种均已生成，且没有重复
+awk -F '\t' '
+NR>1 {
+    n++
+    if (seen[$1]++) {
+        print "[ERROR] Duplicate species:",$1 > "/dev/stderr"
+        bad=1
+    }
+}
+END {
+    if (n!=69 || bad) exit 1
+}' "$TMP"
+
+mv "$TMP" "$OUT"
+
+echo "[PASS] 69 species summarized."
+echo "Output: $OUT"
+BASH
+
+chmod +x summarize_rloop_69.sh
+bash summarize_rloop_69.sh
+#查看结果
+echo "=== 统计物种数量 ==="
+wc -l rloop_summary_69.tsv
+
+echo "=== R-loop覆盖比例最高的10个物种 ==="
+head -n 1 rloop_summary_69.tsv
+
+tail -n +2 rloop_summary_69.tsv |
+sort -t $'\t' -k10,10nr |
+head -n 10
